@@ -24,7 +24,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 app = Flask(__name__)
 
@@ -263,7 +263,7 @@ def self_update():
     try:
         # Download new version
         result = subprocess.run(
-            ["curl", "-sSL", "-o", "/tmp/vpn_agent_new.py", GITHUB_RAW_URL],
+            ["curl", "-sSL", "-H", "Cache-Control: no-cache", "-o", "/tmp/vpn_agent_new.py", f"{GITHUB_RAW_URL}?t={int(time.time())}"],
             capture_output=True,
             text=True,
             timeout=30
