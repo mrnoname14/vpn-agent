@@ -24,7 +24,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 app = Flask(__name__)
 
