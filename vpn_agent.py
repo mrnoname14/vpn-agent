@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Health Agent v1.1.0
+VPN Health Agent v1.2.1
 Lightweight HTTP service monitor for VPN servers.
 
 Runs on each VPN server, provides health API and restart capabilities.
@@ -20,10 +20,11 @@ import subprocess
 import os
 import sys
 import time
+import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 app = Flask(__name__)
 
@@ -135,6 +136,12 @@ def restart_service(service: str) -> dict:
         return {"service": service, "success": False, "error": "Restart timed out"}
     except Exception as e:
         return {"service": service, "success": False, "error": str(e)}
+
+
+def delayed_restart():
+    """Restart agent after delay (runs in background thread)."""
+    time.sleep(2)
+    subprocess.run(["systemctl", "restart", "vpn-agent"])
 
 
 @app.route("/", methods=["GET"])
@@ -263,7 +270,7 @@ def self_update():
         )
         
         if result.returncode != 0:
-            return jsonify({"success": False, "error": "Download failed"}), 500
+            return jsonify({"success": False, "error": f"Download failed: {result.stderr}"}), 500
         
         # Verify it's valid Python
         result = subprocess.run(
@@ -276,11 +283,15 @@ def self_update():
         if result.returncode != 0:
             return jsonify({"success": False, "error": "Invalid Python file"}), 500
         
-        # Replace and restart
+        # Replace file
         subprocess.run(["cp", "/tmp/vpn_agent_new.py", "/opt/vpn_agent.py"], check=True)
-        subprocess.run(["systemctl", "restart", "vpn-agent"], check=True)
         
-        return jsonify({"success": True, "message": "Update initiated, agent restarting..."})
+        # Restart in background after delay (so we can return response)
+        thread = threading.Thread(target=delayed_restart)
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({"success": True, "message": "Update complete, agent restarting in 2 seconds..."})
         
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
