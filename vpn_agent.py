@@ -24,7 +24,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "1.2.4"
+__version__ = "1.2.5"
 
 app = Flask(__name__)
 
@@ -44,7 +44,7 @@ VPN_SERVICES = [
 # GitHub raw URL for self-update
 GITHUB_RAW_URL = os.environ.get(
     "VPN_AGENT_UPDATE_URL",
-    "https://raw.githubusercontent.com/mrnoname14/vpn-agent/main/vpn_agent.py"
+    "https://cdn.jsdelivr.net/gh/mrnoname14/vpn-agent@main/vpn_agent.py"
 )
 
 
