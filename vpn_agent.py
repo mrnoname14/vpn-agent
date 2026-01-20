@@ -23,7 +23,7 @@ import time
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 app = Flask(__name__)
 
@@ -37,6 +37,7 @@ VPN_SERVICES = [
     "xray",
     "shadowsocks",
     "wg-quick@wg0",
+    "AdGuardHome",
 ]
 
 # GitHub raw URL for self-update
