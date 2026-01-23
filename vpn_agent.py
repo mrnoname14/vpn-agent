@@ -38,7 +38,7 @@ import re
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 app = Flask(__name__)
 
@@ -80,6 +80,15 @@ def require_token(f):
             return jsonify({"error": "Unauthorized"}), 401
         return f(*args, **kwargs)
     return decorated
+
+
+def is_valid_uuid(uuid_string: str) -> bool:
+    """Validate UUID format (must be valid hex characters)."""
+    try:
+        uuid.UUID(uuid_string)
+        return True
+    except (ValueError, AttributeError):
+        return False
 
 
 def restart_service_sync(service: str, timeout: int = 30) -> dict:
@@ -156,6 +165,10 @@ def add_vless_key():
     data = request.get_json() or {}
     client_uuid = data.get("uuid") or str(uuid.uuid4())
     flow = data.get("flow", "xtls-rprx-vision")
+    
+    # Validate UUID format
+    if not is_valid_uuid(client_uuid):
+        return jsonify({"error": "Invalid UUID format", "uuid": client_uuid}), 400
     
     try:
         config = read_json_config(XRAY_CONFIG)
@@ -270,6 +283,10 @@ def add_tuic_key():
     data = request.get_json() or {}
     user_uuid = data.get("uuid") or str(uuid.uuid4())
     password = data.get("password") or base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip('=')
+    
+    # Validate UUID format
+    if not is_valid_uuid(user_uuid):
+        return jsonify({"error": "Invalid UUID format", "uuid": user_uuid}), 400
     
     try:
         config = read_json_config(TUIC_CONFIG)
