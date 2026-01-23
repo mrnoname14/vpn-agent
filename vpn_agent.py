@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
 """
-VPN Health Agent v1.3.0
-Lightweight HTTP service monitor for VPN servers.
+VPN Key Agent v2.0.0
+Extended VPN Health Agent with key management for multi-user support.
 
-Endpoints:
+New Endpoints:
+  POST   /keys/vless          - Add VLESS client (UUID)
+  DELETE /keys/vless/{uuid}   - Remove VLESS client
+  POST   /keys/tuic           - Add TUIC user (UUID:password)
+  DELETE /keys/tuic/{uuid}    - Remove TUIC user
+  POST   /keys/shadowsocks    - Add Shadowsocks key
+  DELETE /keys/shadowsocks/{id} - Remove Shadowsocks key
+  POST   /keys/wireguard      - Add WireGuard peer
+  DELETE /keys/wireguard/{pubkey} - Remove WireGuard peer
+  POST   /keys/hysteria2      - Add Hysteria2 user
+  DELETE /keys/hysteria2/{username} - Remove Hysteria2 user
+  GET    /keys/{protocol}     - List all keys for protocol
+
+Original Endpoints (from v1.3):
   GET  /              - basic info (no auth)
   GET  /health        - status of all VPN services
   GET  /health/{svc}  - status of specific service
@@ -16,14 +29,36 @@ import subprocess
 import os
 import sys
 import time
+import json
+import yaml
+import uuid
+import base64
+import secrets
+import re
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "1.3.0"
+__version__ = "2.0.0"
 
 app = Flask(__name__)
 
 API_TOKEN = os.environ.get("VPN_AGENT_TOKEN", "")
+
+# Config paths
+XRAY_CONFIG = "/usr/local/etc/xray/config.json"
+TUIC_CONFIG = "/etc/tuic/config.json"
+SS_CONFIG = "/etc/outline/config.yml"
+WG_CONFIG = "/etc/wireguard/wg0.conf"
+HYSTERIA_CONFIG = "/etc/hysteria/config.yaml"
+
+# Services to restart after config changes
+SERVICE_MAP = {
+    "vless": "xray",
+    "tuic": "tuic",
+    "shadowsocks": "shadowsocks",
+    "wireguard": "wg-quick@wg0",
+    "hysteria2": "hysteria",
+}
 
 VPN_SERVICES = [
     "hysteria",
@@ -46,6 +81,663 @@ def require_token(f):
         return f(*args, **kwargs)
     return decorated
 
+
+def restart_service_sync(service: str, timeout: int = 30) -> dict:
+    """Restart a service and return status."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "restart", service],
+            capture_output=True, text=True, timeout=timeout
+        )
+        if result.returncode != 0:
+            return {"success": False, "error": result.stderr.strip() or "Restart failed"}
+        
+        time.sleep(2)
+        
+        # Check if active
+        result = subprocess.run(
+            ["systemctl", "is-active", service],
+            capture_output=True, text=True, timeout=5
+        )
+        status = result.stdout.strip()
+        return {"success": status == "active", "status": status}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "Restart timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def read_json_config(path: str) -> dict:
+    """Read JSON config file."""
+    with open(path, 'r') as f:
+        return json.load(f)
+
+
+def write_json_config(path: str, data: dict):
+    """Write JSON config file with backup."""
+    # Backup
+    backup_path = f"{path}.bak"
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            backup_data = f.read()
+        with open(backup_path, 'w') as f:
+            f.write(backup_data)
+    
+    # Write new config
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def read_yaml_config(path: str) -> dict:
+    """Read YAML config file."""
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def write_yaml_config(path: str, data: dict):
+    """Write YAML config file with backup."""
+    backup_path = f"{path}.bak"
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            backup_data = f.read()
+        with open(backup_path, 'w') as f:
+            f.write(backup_data)
+    
+    with open(path, 'w') as f:
+        yaml.dump(data, f, default_flow_style=False)
+
+
+# ==================== VLESS (xray) ====================
+
+@app.route("/keys/vless", methods=["POST"])
+@require_token
+def add_vless_key():
+    """Add VLESS client to xray config."""
+    data = request.get_json() or {}
+    client_uuid = data.get("uuid") or str(uuid.uuid4())
+    flow = data.get("flow", "xtls-rprx-vision")
+    
+    try:
+        config = read_json_config(XRAY_CONFIG)
+        
+        # Find VLESS inbound
+        vless_inbound = None
+        for inbound in config.get("inbounds", []):
+            if inbound.get("protocol") == "vless":
+                vless_inbound = inbound
+                break
+        
+        if not vless_inbound:
+            return jsonify({"error": "VLESS inbound not found in config"}), 500
+        
+        # Check if UUID already exists
+        clients = vless_inbound.get("settings", {}).get("clients", [])
+        for client in clients:
+            if client.get("id") == client_uuid:
+                return jsonify({"error": "UUID already exists", "uuid": client_uuid}), 409
+        
+        # Add new client
+        new_client = {"id": client_uuid, "flow": flow}
+        clients.append(new_client)
+        vless_inbound["settings"]["clients"] = clients
+        
+        write_json_config(XRAY_CONFIG, config)
+        
+        # Restart xray
+        restart_result = restart_service_sync("xray")
+        
+        return jsonify({
+            "success": True,
+            "uuid": client_uuid,
+            "flow": flow,
+            "restart": restart_result,
+            "total_clients": len(clients)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/vless/<client_uuid>", methods=["DELETE"])
+@require_token
+def delete_vless_key(client_uuid: str):
+    """Remove VLESS client from xray config."""
+    try:
+        config = read_json_config(XRAY_CONFIG)
+        
+        vless_inbound = None
+        for inbound in config.get("inbounds", []):
+            if inbound.get("protocol") == "vless":
+                vless_inbound = inbound
+                break
+        
+        if not vless_inbound:
+            return jsonify({"error": "VLESS inbound not found"}), 500
+        
+        clients = vless_inbound.get("settings", {}).get("clients", [])
+        original_count = len(clients)
+        
+        # Remove client
+        clients = [c for c in clients if c.get("id") != client_uuid]
+        
+        if len(clients) == original_count:
+            return jsonify({"error": "UUID not found"}), 404
+        
+        vless_inbound["settings"]["clients"] = clients
+        write_json_config(XRAY_CONFIG, config)
+        
+        restart_result = restart_service_sync("xray")
+        
+        return jsonify({
+            "success": True,
+            "deleted_uuid": client_uuid,
+            "restart": restart_result,
+            "total_clients": len(clients)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/vless", methods=["GET"])
+@require_token
+def list_vless_keys():
+    """List all VLESS clients."""
+    try:
+        config = read_json_config(XRAY_CONFIG)
+        
+        for inbound in config.get("inbounds", []):
+            if inbound.get("protocol") == "vless":
+                clients = inbound.get("settings", {}).get("clients", [])
+                return jsonify({
+                    "protocol": "vless",
+                    "count": len(clients),
+                    "clients": [{"uuid": c.get("id"), "flow": c.get("flow")} for c in clients]
+                })
+        
+        return jsonify({"error": "VLESS inbound not found"}), 500
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ==================== TUIC ====================
+
+@app.route("/keys/tuic", methods=["POST"])
+@require_token
+def add_tuic_key():
+    """Add TUIC user."""
+    data = request.get_json() or {}
+    user_uuid = data.get("uuid") or str(uuid.uuid4())
+    password = data.get("password") or base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip('=')
+    
+    try:
+        config = read_json_config(TUIC_CONFIG)
+        
+        users = config.get("users", {})
+        
+        if user_uuid in users:
+            return jsonify({"error": "UUID already exists", "uuid": user_uuid}), 409
+        
+        users[user_uuid] = password
+        config["users"] = users
+        
+        write_json_config(TUIC_CONFIG, config)
+        
+        restart_result = restart_service_sync("tuic")
+        
+        return jsonify({
+            "success": True,
+            "uuid": user_uuid,
+            "password": password,
+            "restart": restart_result,
+            "total_users": len(users)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/tuic/<user_uuid>", methods=["DELETE"])
+@require_token
+def delete_tuic_key(user_uuid: str):
+    """Remove TUIC user."""
+    try:
+        config = read_json_config(TUIC_CONFIG)
+        
+        users = config.get("users", {})
+        
+        if user_uuid not in users:
+            return jsonify({"error": "UUID not found"}), 404
+        
+        del users[user_uuid]
+        config["users"] = users
+        
+        write_json_config(TUIC_CONFIG, config)
+        
+        restart_result = restart_service_sync("tuic")
+        
+        return jsonify({
+            "success": True,
+            "deleted_uuid": user_uuid,
+            "restart": restart_result,
+            "total_users": len(users)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/tuic", methods=["GET"])
+@require_token
+def list_tuic_keys():
+    """List all TUIC users."""
+    try:
+        config = read_json_config(TUIC_CONFIG)
+        users = config.get("users", {})
+        
+        return jsonify({
+            "protocol": "tuic",
+            "count": len(users),
+            "users": [{"uuid": k, "password": v} for k, v in users.items()]
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ==================== Shadowsocks ====================
+
+@app.route("/keys/shadowsocks", methods=["POST"])
+@require_token
+def add_shadowsocks_key():
+    """Add Shadowsocks key."""
+    data = request.get_json() or {}
+    key_id = data.get("id") or f"user{int(time.time())}"
+    port = data.get("port", 8388)
+    cipher = data.get("cipher", "chacha20-ietf-poly1305")
+    secret = data.get("secret") or base64.b64encode(secrets.token_bytes(32)).decode()
+    
+    try:
+        config = read_yaml_config(SS_CONFIG)
+        
+        keys = config.get("keys", [])
+        
+        # Check if ID exists
+        for key in keys:
+            if key.get("id") == key_id:
+                return jsonify({"error": "Key ID already exists", "id": key_id}), 409
+        
+        new_key = {
+            "id": key_id,
+            "port": port,
+            "cipher": cipher,
+            "secret": secret
+        }
+        keys.append(new_key)
+        config["keys"] = keys
+        
+        write_yaml_config(SS_CONFIG, config)
+        
+        restart_result = restart_service_sync("shadowsocks")
+        
+        return jsonify({
+            "success": True,
+            "id": key_id,
+            "port": port,
+            "cipher": cipher,
+            "secret": secret,
+            "restart": restart_result,
+            "total_keys": len(keys)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/shadowsocks/<key_id>", methods=["DELETE"])
+@require_token
+def delete_shadowsocks_key(key_id: str):
+    """Remove Shadowsocks key."""
+    try:
+        config = read_yaml_config(SS_CONFIG)
+        
+        keys = config.get("keys", [])
+        original_count = len(keys)
+        
+        keys = [k for k in keys if k.get("id") != key_id]
+        
+        if len(keys) == original_count:
+            return jsonify({"error": "Key ID not found"}), 404
+        
+        config["keys"] = keys
+        write_yaml_config(SS_CONFIG, config)
+        
+        restart_result = restart_service_sync("shadowsocks")
+        
+        return jsonify({
+            "success": True,
+            "deleted_id": key_id,
+            "restart": restart_result,
+            "total_keys": len(keys)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/shadowsocks", methods=["GET"])
+@require_token
+def list_shadowsocks_keys():
+    """List all Shadowsocks keys."""
+    try:
+        config = read_yaml_config(SS_CONFIG)
+        keys = config.get("keys", [])
+        
+        return jsonify({
+            "protocol": "shadowsocks",
+            "count": len(keys),
+            "keys": keys
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ==================== WireGuard ====================
+
+def generate_wireguard_keypair():
+    """Generate WireGuard keypair."""
+    result = subprocess.run(["wg", "genkey"], capture_output=True, text=True)
+    private_key = result.stdout.strip()
+    
+    result = subprocess.run(["wg", "pubkey"], input=private_key, capture_output=True, text=True)
+    public_key = result.stdout.strip()
+    
+    return private_key, public_key
+
+
+def get_next_wg_ip(config_content: str) -> str:
+    """Get next available WireGuard IP address."""
+    # Find all existing IPs
+    ips = re.findall(r'AllowedIPs\s*=\s*10\.66\.66\.(\d+)/32', config_content)
+    used = set(int(ip) for ip in ips)
+    
+    # Server uses .1, clients start from .2
+    for i in range(2, 255):
+        if i not in used:
+            return f"10.66.66.{i}"
+    
+    raise Exception("No available IP addresses in WireGuard subnet")
+
+
+@app.route("/keys/wireguard", methods=["POST"])
+@require_token
+def add_wireguard_key():
+    """Add WireGuard peer."""
+    data = request.get_json() or {}
+    
+    try:
+        # Read current config
+        with open(WG_CONFIG, 'r') as f:
+            config_content = f.read()
+        
+        # Generate or use provided keys
+        if data.get("public_key"):
+            public_key = data["public_key"]
+            private_key = data.get("private_key", "")  # Client keeps private key
+        else:
+            private_key, public_key = generate_wireguard_keypair()
+        
+        # Check if public key already exists
+        if public_key in config_content:
+            return jsonify({"error": "Public key already exists"}), 409
+        
+        # Get next available IP
+        client_ip = data.get("client_ip") or get_next_wg_ip(config_content)
+        
+        # Add peer section
+        peer_section = f"""
+[Peer]
+# Added by VPN Agent
+PublicKey = {public_key}
+AllowedIPs = {client_ip}/32
+"""
+        
+        # Append to config
+        with open(WG_CONFIG, 'a') as f:
+            f.write(peer_section)
+        
+        # Reload WireGuard (wg syncconf is faster than restart)
+        result = subprocess.run(
+            ["wg", "syncconf", "wg0", "/dev/stdin"],
+            input=subprocess.run(["wg-quick", "strip", "wg0"], capture_output=True, text=True).stdout,
+            capture_output=True, text=True
+        )
+        
+        if result.returncode != 0:
+            # Fallback to restart
+            restart_result = restart_service_sync("wg-quick@wg0")
+        else:
+            restart_result = {"success": True, "method": "syncconf"}
+        
+        return jsonify({
+            "success": True,
+            "public_key": public_key,
+            "private_key": private_key,  # Only if we generated it
+            "client_ip": client_ip,
+            "restart": restart_result
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/wireguard/<path:public_key>", methods=["DELETE"])
+@require_token
+def delete_wireguard_key(public_key: str):
+    """Remove WireGuard peer by public key."""
+    try:
+        with open(WG_CONFIG, 'r') as f:
+            config_content = f.read()
+        
+        if public_key not in config_content:
+            return jsonify({"error": "Public key not found"}), 404
+        
+        # Remove peer section
+        # Pattern: [Peer] followed by lines until next [Peer] or end
+        pattern = rf'\[Peer\]\s*\n(?:.*\n)*?PublicKey\s*=\s*{re.escape(public_key)}\s*\n(?:.*\n)*?(?=\[|$)'
+        new_content = re.sub(pattern, '', config_content)
+        
+        with open(WG_CONFIG, 'w') as f:
+            f.write(new_content)
+        
+        # Reload
+        result = subprocess.run(
+            ["wg", "syncconf", "wg0", "/dev/stdin"],
+            input=subprocess.run(["wg-quick", "strip", "wg0"], capture_output=True, text=True).stdout,
+            capture_output=True, text=True
+        )
+        
+        if result.returncode != 0:
+            restart_result = restart_service_sync("wg-quick@wg0")
+        else:
+            restart_result = {"success": True, "method": "syncconf"}
+        
+        return jsonify({
+            "success": True,
+            "deleted_public_key": public_key,
+            "restart": restart_result
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/wireguard", methods=["GET"])
+@require_token
+def list_wireguard_keys():
+    """List all WireGuard peers."""
+    try:
+        with open(WG_CONFIG, 'r') as f:
+            config_content = f.read()
+        
+        # Parse peers
+        peers = []
+        peer_blocks = re.findall(r'\[Peer\](.*?)(?=\[|$)', config_content, re.DOTALL)
+        
+        for block in peer_blocks:
+            public_key = re.search(r'PublicKey\s*=\s*(\S+)', block)
+            allowed_ips = re.search(r'AllowedIPs\s*=\s*(\S+)', block)
+            
+            if public_key:
+                peers.append({
+                    "public_key": public_key.group(1),
+                    "allowed_ips": allowed_ips.group(1) if allowed_ips else None
+                })
+        
+        return jsonify({
+            "protocol": "wireguard",
+            "count": len(peers),
+            "peers": peers
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ==================== Hysteria2 ====================
+
+@app.route("/keys/hysteria2", methods=["POST"])
+@require_token
+def add_hysteria2_key():
+    """Add Hysteria2 user (userpass mode)."""
+    data = request.get_json() or {}
+    username = data.get("username") or f"user{int(time.time())}"
+    password = data.get("password") or secrets.token_urlsafe(16)
+    
+    try:
+        config = read_yaml_config(HYSTERIA_CONFIG)
+        
+        auth = config.get("auth", {})
+        
+        # Check current auth type
+        if auth.get("type") == "password":
+            # Need to convert to userpass mode
+            old_password = auth.get("password", "")
+            config["auth"] = {
+                "type": "userpass",
+                "userpass": {
+                    "legacy": old_password,  # Keep old password as legacy user
+                    username: password
+                }
+            }
+        elif auth.get("type") == "userpass":
+            userpass = auth.get("userpass", {})
+            if username in userpass:
+                return jsonify({"error": "Username already exists", "username": username}), 409
+            userpass[username] = password
+            config["auth"]["userpass"] = userpass
+        else:
+            # First user
+            config["auth"] = {
+                "type": "userpass",
+                "userpass": {
+                    username: password
+                }
+            }
+        
+        write_yaml_config(HYSTERIA_CONFIG, config)
+        
+        restart_result = restart_service_sync("hysteria")
+        
+        userpass = config["auth"].get("userpass", {})
+        
+        return jsonify({
+            "success": True,
+            "username": username,
+            "password": password,
+            "restart": restart_result,
+            "total_users": len(userpass)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/hysteria2/<username>", methods=["DELETE"])
+@require_token
+def delete_hysteria2_key(username: str):
+    """Remove Hysteria2 user."""
+    try:
+        config = read_yaml_config(HYSTERIA_CONFIG)
+        
+        auth = config.get("auth", {})
+        
+        if auth.get("type") != "userpass":
+            return jsonify({"error": "Hysteria2 not in userpass mode"}), 400
+        
+        userpass = auth.get("userpass", {})
+        
+        if username not in userpass:
+            return jsonify({"error": "Username not found"}), 404
+        
+        del userpass[username]
+        config["auth"]["userpass"] = userpass
+        
+        write_yaml_config(HYSTERIA_CONFIG, config)
+        
+        restart_result = restart_service_sync("hysteria")
+        
+        return jsonify({
+            "success": True,
+            "deleted_username": username,
+            "restart": restart_result,
+            "total_users": len(userpass)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/hysteria2", methods=["GET"])
+@require_token
+def list_hysteria2_keys():
+    """List all Hysteria2 users."""
+    try:
+        config = read_yaml_config(HYSTERIA_CONFIG)
+        
+        auth = config.get("auth", {})
+        
+        if auth.get("type") == "password":
+            # Single password mode
+            return jsonify({
+                "protocol": "hysteria2",
+                "mode": "password",
+                "count": 1,
+                "users": [{"username": "default", "password": auth.get("password", "")}]
+            })
+        elif auth.get("type") == "userpass":
+            userpass = auth.get("userpass", {})
+            return jsonify({
+                "protocol": "hysteria2",
+                "mode": "userpass",
+                "count": len(userpass),
+                "users": [{"username": k, "password": v} for k, v in userpass.items()]
+            })
+        else:
+            return jsonify({
+                "protocol": "hysteria2",
+                "mode": "unknown",
+                "count": 0,
+                "users": []
+            })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ==================== Original Health Endpoints ====================
 
 def get_service_status(service: str) -> dict:
     try:
@@ -80,27 +772,9 @@ def get_service_status(service: str) -> dict:
         return {"service": service, "status": "error", "error": str(e)}
 
 
-def restart_service(service: str) -> dict:
-    try:
-        result = subprocess.run(
-            ["systemctl", "restart", service],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            return {"service": service, "success": False, "error": result.stderr.strip() or "Restart failed"}
-        
-        time.sleep(2)
-        status = get_service_status(service)
-        return {"service": service, "success": status["status"] == "active", "status": status["status"]}
-    except subprocess.TimeoutExpired:
-        return {"service": service, "success": False, "error": "Restart timed out"}
-    except Exception as e:
-        return {"service": service, "success": False, "error": str(e)}
-
-
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"service": "VPN Health Agent", "version": __version__, "status": "running"})
+    return jsonify({"service": "VPN Key Agent", "version": __version__, "status": "running"})
 
 
 @app.route("/health", methods=["GET"])
@@ -129,8 +803,8 @@ def health_service(service: str):
 def restart(service: str):
     if service not in VPN_SERVICES:
         return jsonify({"error": f"Unknown service: {service}"}), 404
-    result = restart_service(service)
-    return jsonify(result), 200 if result.get("success") else 500
+    result = restart_service_sync(service)
+    return jsonify({"service": service, **result}), 200 if result.get("success") else 500
 
 
 @app.route("/restart-all", methods=["POST"])
@@ -140,7 +814,8 @@ def restart_all():
     for svc in VPN_SERVICES:
         status = get_service_status(svc)
         if status["status"] != "active":
-            results.append(restart_service(svc))
+            result = restart_service_sync(svc)
+            results.append({"service": svc, **result})
     return jsonify({
         "restarted": [r["service"] for r in results if r.get("success")],
         "failed": [r["service"] for r in results if not r.get("success")],
@@ -184,4 +859,5 @@ if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     if not API_TOKEN:
         print("WARNING: VPN_AGENT_TOKEN not set!")
+    print(f"VPN Key Agent v{__version__} starting on port {port}")
     app.run(host="0.0.0.0", port=port, threaded=True)
