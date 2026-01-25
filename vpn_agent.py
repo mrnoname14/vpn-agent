@@ -47,9 +47,19 @@ API_TOKEN = os.environ.get("VPN_AGENT_TOKEN", "")
 # Config paths
 XRAY_CONFIG = "/usr/local/etc/xray/config.json"
 TUIC_CONFIG = "/etc/tuic/config.json"
+TUIC_CONFIG_D2 = "/etc/tuic/config2.json"  # Second domain
 SS_CONFIG = "/etc/outline/config.yml"
 WG_CONFIG = "/etc/wireguard/wg0.conf"
 HYSTERIA_CONFIG = "/etc/hysteria/config.yaml"
+HYSTERIA_CONFIG_D2 = "/etc/hysteria/config2.yaml"  # Second domain
+
+# Multi-domain config mapping
+TUIC_CONFIGS = [TUIC_CONFIG, TUIC_CONFIG_D2]
+HYSTERIA_CONFIGS = [HYSTERIA_CONFIG, HYSTERIA_CONFIG_D2]
+
+# Services for each domain
+TUIC_SERVICES = ["tuic", "tuic2"]  # tuic for D1, tuic2 for D2
+HYSTERIA_SERVICES = ["hysteria", "hysteria2"]  # hysteria for D1, hysteria2 for D2
 
 # Services to restart after config changes
 SERVICE_MAP = {
@@ -279,17 +289,25 @@ def list_vless_keys():
 @app.route("/keys/tuic", methods=["POST"])
 @require_token
 def add_tuic_key():
-    """Add TUIC user."""
+    """Add TUIC user. Supports domain_index for multi-domain setups."""
     data = request.get_json() or {}
     user_uuid = data.get("uuid") or str(uuid.uuid4())
     password = data.get("password") or base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip('=')
+    domain_index = data.get("domain_index", 0)
     
     # Validate UUID format
     if not is_valid_uuid(user_uuid):
         return jsonify({"error": "Invalid UUID format", "uuid": user_uuid}), 400
     
+    # Validate domain_index
+    if domain_index < 0 or domain_index >= len(TUIC_CONFIGS):
+        return jsonify({"error": f"Invalid domain_index: {domain_index}"}), 400
+    
+    config_path = TUIC_CONFIGS[domain_index]
+    service_name = TUIC_SERVICES[domain_index]
+    
     try:
-        config = read_json_config(TUIC_CONFIG)
+        config = read_json_config(config_path)
         
         users = config.get("users", {})
         
@@ -299,14 +317,15 @@ def add_tuic_key():
         users[user_uuid] = password
         config["users"] = users
         
-        write_json_config(TUIC_CONFIG, config)
+        write_json_config(config_path, config)
         
-        restart_result = restart_service_sync("tuic")
+        restart_result = restart_service_sync(service_name)
         
         return jsonify({
             "success": True,
             "uuid": user_uuid,
             "password": password,
+            "domain_index": domain_index,
             "restart": restart_result,
             "total_users": len(users)
         })
@@ -318,9 +337,18 @@ def add_tuic_key():
 @app.route("/keys/tuic/<user_uuid>", methods=["DELETE"])
 @require_token
 def delete_tuic_key(user_uuid: str):
-    """Remove TUIC user."""
+    """Remove TUIC user. Supports domain_index query param for multi-domain setups."""
+    domain_index = request.args.get("domain_index", 0, type=int)
+    
+    # Validate domain_index
+    if domain_index < 0 or domain_index >= len(TUIC_CONFIGS):
+        return jsonify({"error": f"Invalid domain_index: {domain_index}"}), 400
+    
+    config_path = TUIC_CONFIGS[domain_index]
+    service_name = TUIC_SERVICES[domain_index]
+    
     try:
-        config = read_json_config(TUIC_CONFIG)
+        config = read_json_config(config_path)
         
         users = config.get("users", {})
         
@@ -330,13 +358,14 @@ def delete_tuic_key(user_uuid: str):
         del users[user_uuid]
         config["users"] = users
         
-        write_json_config(TUIC_CONFIG, config)
+        write_json_config(config_path, config)
         
-        restart_result = restart_service_sync("tuic")
+        restart_result = restart_service_sync(service_name)
         
         return jsonify({
             "success": True,
             "deleted_uuid": user_uuid,
+            "domain_index": domain_index,
             "restart": restart_result,
             "total_users": len(users)
         })
@@ -628,13 +657,21 @@ def list_wireguard_keys():
 @app.route("/keys/hysteria2", methods=["POST"])
 @require_token
 def add_hysteria2_key():
-    """Add Hysteria2 user (userpass mode)."""
+    """Add Hysteria2 user (userpass mode). Supports domain_index for multi-domain setups."""
     data = request.get_json() or {}
     username = data.get("username") or f"user{int(time.time())}"
     password = data.get("password") or secrets.token_urlsafe(16)
+    domain_index = data.get("domain_index", 0)
+    
+    # Validate domain_index
+    if domain_index < 0 or domain_index >= len(HYSTERIA_CONFIGS):
+        return jsonify({"error": f"Invalid domain_index: {domain_index}"}), 400
+    
+    config_path = HYSTERIA_CONFIGS[domain_index]
+    service_name = HYSTERIA_SERVICES[domain_index]
     
     try:
-        config = read_yaml_config(HYSTERIA_CONFIG)
+        config = read_yaml_config(config_path)
         
         auth = config.get("auth", {})
         
@@ -664,9 +701,9 @@ def add_hysteria2_key():
                 }
             }
         
-        write_yaml_config(HYSTERIA_CONFIG, config)
+        write_yaml_config(config_path, config)
         
-        restart_result = restart_service_sync("hysteria")
+        restart_result = restart_service_sync(service_name)
         
         userpass = config["auth"].get("userpass", {})
         
@@ -674,6 +711,7 @@ def add_hysteria2_key():
             "success": True,
             "username": username,
             "password": password,
+            "domain_index": domain_index,
             "restart": restart_result,
             "total_users": len(userpass)
         })
@@ -685,9 +723,18 @@ def add_hysteria2_key():
 @app.route("/keys/hysteria2/<username>", methods=["DELETE"])
 @require_token
 def delete_hysteria2_key(username: str):
-    """Remove Hysteria2 user."""
+    """Remove Hysteria2 user. Supports domain_index query param for multi-domain setups."""
+    domain_index = request.args.get("domain_index", 0, type=int)
+    
+    # Validate domain_index
+    if domain_index < 0 or domain_index >= len(HYSTERIA_CONFIGS):
+        return jsonify({"error": f"Invalid domain_index: {domain_index}"}), 400
+    
+    config_path = HYSTERIA_CONFIGS[domain_index]
+    service_name = HYSTERIA_SERVICES[domain_index]
+    
     try:
-        config = read_yaml_config(HYSTERIA_CONFIG)
+        config = read_yaml_config(config_path)
         
         auth = config.get("auth", {})
         
@@ -702,13 +749,14 @@ def delete_hysteria2_key(username: str):
         del userpass[username]
         config["auth"]["userpass"] = userpass
         
-        write_yaml_config(HYSTERIA_CONFIG, config)
+        write_yaml_config(config_path, config)
         
-        restart_result = restart_service_sync("hysteria")
+        restart_result = restart_service_sync(service_name)
         
         return jsonify({
             "success": True,
             "deleted_username": username,
+            "domain_index": domain_index,
             "restart": restart_result,
             "total_users": len(userpass)
         })
