@@ -38,7 +38,7 @@ import re
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 
 app = Flask(__name__)
 
@@ -373,7 +373,7 @@ def add_shadowsocks_key():
     key_id = data.get("id") or f"user{int(time.time())}"
     port = data.get("port", 8388)
     cipher = data.get("cipher", "chacha20-ietf-poly1305")
-    secret = data.get("secret") or base64.b64encode(secrets.token_bytes(32)).decode()
+    secret = data.get("secret") or secrets.token_urlsafe(32)
     
     try:
         config = read_yaml_config(SS_CONFIG)
