@@ -38,7 +38,7 @@ import re
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "2.0.2"
+__version__ = "2.0.4"
 
 app = Flask(__name__)
 
@@ -197,7 +197,14 @@ def add_vless_key():
         clients = vless_inbound.get("settings", {}).get("clients", [])
         for client in clients:
             if client.get("id") == client_uuid:
-                return jsonify({"error": "UUID already exists", "uuid": client_uuid}), 409
+                # Return existing key instead of error
+                return jsonify({
+                    "success": True,
+                    "uuid": client_uuid,
+                    "flow": client.get("flow"),
+                    "existed": True,
+                    "total_clients": len(clients)
+                })
         
         # Add new client
         new_client = {"id": client_uuid, "flow": flow}
@@ -312,7 +319,15 @@ def add_tuic_key():
         users = config.get("users", {})
         
         if user_uuid in users:
-            return jsonify({"error": "UUID already exists", "uuid": user_uuid}), 409
+            # Return existing key instead of error
+            return jsonify({
+                "success": True,
+                "uuid": user_uuid,
+                "password": users[user_uuid],
+                "domain_index": domain_index,
+                "existed": True,
+                "total_users": len(users)
+            })
         
         users[user_uuid] = password
         config["users"] = users
@@ -412,7 +427,16 @@ def add_shadowsocks_key():
         # Check if ID exists
         for key in keys:
             if key.get("id") == key_id:
-                return jsonify({"error": "Key ID already exists", "id": key_id}), 409
+                # Return existing key instead of error
+                return jsonify({
+                    "success": True,
+                    "id": key_id,
+                    "port": key.get("port"),
+                    "cipher": key.get("cipher"),
+                    "secret": key.get("secret"),
+                    "existed": True,
+                    "total_keys": len(keys)
+                })
         
         new_key = {
             "id": key_id,
@@ -537,7 +561,17 @@ def add_wireguard_key():
         
         # Check if public key already exists
         if public_key in config_content:
-            return jsonify({"error": "Public key already exists"}), 409
+            # Find existing peer's IP
+            ip_match = re.search(rf'PublicKey\s*=\s*{re.escape(public_key)}[\s\S]*?AllowedIPs\s*=\s*(\S+)', config_content)
+            existing_ip = ip_match.group(1).replace('/32', '') if ip_match else None
+            # Return existing key instead of error
+            return jsonify({
+                "success": True,
+                "public_key": public_key,
+                "private_key": private_key,
+                "client_ip": existing_ip,
+                "existed": True
+            })
         
         # Get next available IP
         client_ip = data.get("client_ip") or get_next_wg_ip(config_content)
@@ -689,7 +723,15 @@ def add_hysteria2_key():
         elif auth.get("type") == "userpass":
             userpass = auth.get("userpass", {})
             if username in userpass:
-                return jsonify({"error": "Username already exists", "username": username}), 409
+                # Return existing key instead of error
+                return jsonify({
+                    "success": True,
+                    "username": username,
+                    "password": userpass[username],
+                    "domain_index": domain_index,
+                    "existed": True,
+                    "total_users": len(userpass)
+                })
             userpass[username] = password
             config["auth"]["userpass"] = userpass
         else:
