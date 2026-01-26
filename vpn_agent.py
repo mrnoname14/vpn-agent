@@ -36,6 +36,7 @@ import secrets
 import re
 import threading
 import logging
+import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
@@ -43,7 +44,7 @@ from functools import wraps
 from collections import deque
 from flask import Flask, jsonify, request
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 
 # ==================== Configuration ====================
 
