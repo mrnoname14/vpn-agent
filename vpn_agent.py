@@ -1,33 +1,21 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v3.2.0
-Enterprise VPN Agent with WebSocket connection to Central Manager.
+VPN Key Agent v3.3.0 (Simplified)
+
+Changes from v3.2.x:
+- Removed IPBlocker (duplicate detection moved to API fingerprint_service)
+- Simplified ConnectionTracker (metrics only)
+- Cleaner codebase
 
 Features:
-- WebSocket connection to Central Manager (primary)
-- HTTP fallback for key management
-- Real-time connection tracking for ALL 5 protocols:
-  * VLESS (xray) - via access.log parsing
-  * WireGuard - via wg show command
-  * Hysteria2 - via trafficStats API
-  * TUIC - via ss port monitoring
-  * Shadowsocks - via ss port monitoring
-- Batch event sending for efficiency
-- Heartbeat with metrics and connection counts
-- IP blocking for duplicate detection (iptables)
-
-Run modes:
-- WebSocket mode: Agent connects to Central Manager, sends events
-- HTTP mode: Flask server for key management commands
+- WebSocket connection to Central Manager
+- HTTP API for key management
+- Heartbeat with metrics (CPU, RAM, connections)
+- Key management for all 5 protocols
 
 Usage:
-  python vpn_agent.py                    # HTTP mode only (legacy)
+  python vpn_agent.py                    # HTTP mode only
   python vpn_agent.py --websocket        # WebSocket + HTTP mode
-  
-Environment:
-  VPN_AGENT_TOKEN        - Authentication token
-  CENTRAL_MANAGER_URL    - WebSocket URL (ws://api.example.com/...)
-  VPN_SERVER_ID          - Server ID in database
 """
 
 import subprocess
@@ -45,12 +33,10 @@ import logging
 import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field
 from functools import wraps
-from collections import deque
 from flask import Flask, jsonify, request
 
-__version__ = "3.2.2"
+__version__ = "3.3.0"
 
 # ==================== Configuration ====================
 
@@ -74,300 +60,53 @@ HYSTERIA_SERVICES = ["hysteria", "hysteria2"]
 
 VPN_SERVICES = ["hysteria", "hysteria2", "tuic", "tuic2", "xray", "shadowsocks", "wg-quick@wg0", "AdGuardHome"]
 
-XRAY_ACCESS_LOG = "/var/log/xray/access.log"
-
-# Hysteria2 trafficStats API
-HYSTERIA_API_URL = "http://127.0.0.1:9999"
-HYSTERIA_API_SECRET = os.environ.get("HYSTERIA_API_SECRET", "agent_stats_token_2024")
-
-# Port mapping for protocols (for ss-based tracking)
-PROTOCOL_PORTS = {
-    "vless": 443,
-    "hysteria2": 8443,
-    "tuic": 8444,
-    "shadowsocks": 8388,
-    "wireguard": 51820,
-}
-
-# IP block duration (seconds)
-IP_BLOCK_DURATION = 1800  # 30 minutes
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("vpn-agent")
 
 app = Flask(__name__)
 
-# ==================== IP Blocking ====================
+# ==================== Metrics ====================
 
-class IPBlocker:
-    """Manages IP blocking via iptables for duplicate detection."""
+def get_server_metrics() -> dict:
+    """Get server metrics for heartbeat."""
+    info = {"version": __version__}
+    try:
+        with open("/proc/loadavg") as f:
+            load = [float(x) for x in f.read().split()[:3]]
+            info["cpu_percent"] = round(load[0] * 100, 1)
+        with open("/proc/meminfo") as f:
+            meminfo = {}
+            for line in f:
+                parts = line.split()
+                if parts[0] in ["MemTotal:", "MemAvailable:"]:
+                    meminfo[parts[0][:-1]] = int(parts[1])
+            total = meminfo.get("MemTotal", 0)
+            available = meminfo.get("MemAvailable", 0)
+            if total:
+                info["ram_percent"] = round((total - available) / total * 100, 1)
+    except:
+        pass
     
-    CHAIN_NAME = "VPN_BLOCK"
-    
-    def __init__(self):
-        self._blocked_ips: Dict[str, float] = {}  # ip -> unblock_time
-        self._lock = threading.Lock()
-        self._setup_chain()
-    
-    def _setup_chain(self):
-        """Create iptables chain if not exists."""
-        try:
-            # Check if chain exists
-            result = subprocess.run(
-                ["iptables", "-L", self.CHAIN_NAME, "-n"],
-                capture_output=True, text=True
-            )
-            if result.returncode != 0:
-                # Create chain
-                subprocess.run(["iptables", "-N", self.CHAIN_NAME], capture_output=True)
-                # Add chain to INPUT
-                subprocess.run(
-                    ["iptables", "-I", "INPUT", "-j", self.CHAIN_NAME],
-                    capture_output=True
-                )
-                logger.info(f"Created iptables chain: {self.CHAIN_NAME}")
-        except Exception as e:
-            logger.error(f"Failed to setup iptables chain: {e}")
-    
-    def block_ip(self, ip: str, duration: int = IP_BLOCK_DURATION) -> bool:
-        """Block IP for specified duration."""
-        if not self._is_valid_ip(ip):
-            logger.warning(f"Invalid IP: {ip}")
-            return False
-        
-        try:
-            with self._lock:
-                # Add iptables rule
-                result = subprocess.run(
-                    ["iptables", "-A", self.CHAIN_NAME, "-s", ip, "-j", "DROP"],
-                    capture_output=True, text=True
-                )
-                
-                if result.returncode == 0:
-                    self._blocked_ips[ip] = time.time() + duration
-                    logger.info(f"Blocked IP: {ip} for {duration}s")
-                    return True
-                else:
-                    logger.error(f"Failed to block IP {ip}: {result.stderr}")
-                    return False
-        except Exception as e:
-            logger.error(f"Error blocking IP {ip}: {e}")
-            return False
-    
-    def unblock_ip(self, ip: str) -> bool:
-        """Unblock IP."""
-        if not self._is_valid_ip(ip):
-            return False
-        
-        try:
-            with self._lock:
-                # Remove iptables rule
-                result = subprocess.run(
-                    ["iptables", "-D", self.CHAIN_NAME, "-s", ip, "-j", "DROP"],
-                    capture_output=True, text=True
-                )
-                
-                if ip in self._blocked_ips:
-                    del self._blocked_ips[ip]
-                
-                if result.returncode == 0:
-                    logger.info(f"Unblocked IP: {ip}")
-                    return True
-                return False
-        except Exception as e:
-            logger.error(f"Error unblocking IP {ip}: {e}")
-            return False
-    
-    def cleanup_expired(self):
-        """Remove expired blocks."""
-        now = time.time()
-        expired = [ip for ip, unblock_time in self._blocked_ips.items() if now >= unblock_time]
-        for ip in expired:
-            self.unblock_ip(ip)
-    
-    def get_blocked_ips(self) -> List[Dict[str, Any]]:
-        """Get list of blocked IPs with remaining time."""
-        now = time.time()
-        with self._lock:
-            return [
-                {"ip": ip, "remaining_seconds": int(unblock_time - now)}
-                for ip, unblock_time in self._blocked_ips.items()
-                if unblock_time > now
-            ]
-    
-    def _is_valid_ip(self, ip: str) -> bool:
-        """Validate IP address."""
-        try:
-            parts = ip.split('.')
-            return len(parts) == 4 and all(0 <= int(p) <= 255 for p in parts)
-        except:
-            return False
+    # Count active connections via ss
+    info["active_connections"] = _count_active_connections()
+    return info
 
 
-ip_blocker = IPBlocker()
-
-# ==================== Connection Tracking ====================
-
-@dataclass
-class ConnectionEvent:
-    event_type: str
-    protocol: str
-    key_id: str
-    client_ip: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    
-    def to_dict(self):
-        return {"event_type": self.event_type, "protocol": self.protocol, "key_id": self.key_id, 
-                "client_ip": self.client_ip, "timestamp": self.timestamp.isoformat()}
-
-
-class ConnectionTracker:
-    """Tracks active VPN connections by parsing logs."""
-    
-    def __init__(self):
-        self._active: Dict[str, str] = {}
-        self._event_queue: deque = deque(maxlen=1000)
-        self._log_positions: Dict[str, int] = {}
-        self._lock = threading.Lock()
-    
-    def get_pending_events(self) -> List[ConnectionEvent]:
-        with self._lock:
-            events = list(self._event_queue)
-            self._event_queue.clear()
-            return events
-    
-    def track_connection(self, protocol: str, key_id: str, client_ip: str):
-        conn_key = f"{protocol}:{key_id}"
-        with self._lock:
-            if conn_key not in self._active or self._active[conn_key] != client_ip:
-                self._active[conn_key] = client_ip
-                self._event_queue.append(ConnectionEvent("connect", protocol, key_id, client_ip))
-                logger.info(f"Connect: {protocol} {key_id[:8]}... from {client_ip}")
-    
-    def get_active_count(self) -> int:
-        with self._lock:
-            return len(self._active)
-    
-    def get_active_by_protocol(self) -> Dict[str, int]:
-        with self._lock:
-            counts = {}
-            for conn_key in self._active:
-                protocol = conn_key.split(":")[0]
-                counts[protocol] = counts.get(protocol, 0) + 1
-            return counts
-    
-    def parse_xray_log(self):
-        if not os.path.exists(XRAY_ACCESS_LOG):
-            return
-        try:
-            with open(XRAY_ACCESS_LOG, 'r') as f:
-                last_pos = self._log_positions.get(XRAY_ACCESS_LOG, 0)
-                f.seek(0, 2)
-                current_size = f.tell()
-                if current_size < last_pos:
-                    last_pos = 0
-                f.seek(last_pos)
-                for line in f:
-                    match = re.search(r'from[:\s]+([\d.]+):\d+.*?email[:\s]+([a-f0-9-]{36})', line, re.IGNORECASE)
-                    if match:
-                        self.track_connection("vless", match.group(2), match.group(1))
-                self._log_positions[XRAY_ACCESS_LOG] = f.tell()
-        except Exception as e:
-            logger.error(f"Error parsing xray log: {e}")
-    
-    def parse_wireguard(self):
-        try:
-            result = subprocess.run(["wg", "show", "wg0", "dump"], capture_output=True, text=True, timeout=5)
-            for line in result.stdout.strip().split('\n')[1:]:
-                parts = line.split('\t')
-                if len(parts) >= 5:
-                    public_key, endpoint, latest_handshake = parts[0], parts[2], int(parts[4]) if parts[4].isdigit() else 0
-                    if endpoint != "(none)" and latest_handshake > 0 and time.time() - latest_handshake < 180:
-                        self.track_connection("wireguard", public_key, endpoint.split(':')[0])
-        except Exception:
-            pass
-    
-    def parse_hysteria2(self):
-        """Parse Hysteria2 trafficStats API to get active connections."""
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                f"{HYSTERIA_API_URL}/online",
-                headers={"Authorization": HYSTERIA_API_SECRET}
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode())
-                # Response format: {"username1": {"tx": 123, "rx": 456}, ...}
-                for username, stats in data.items():
-                    # We don't have IP from API, but we can track the connection
-                    # For now, use a placeholder - we'll get real IP from ss
-                    self.track_connection("hysteria2", username, "api")
-        except Exception as e:
-            if "urlopen" not in str(e.__class__.__name__).lower():
-                logger.debug(f"Hysteria2 API error: {e}")
-    
-    def parse_port_connections(self, protocol: str, port: int) -> List[Dict[str, Any]]:
-        """
-        Parse active connections on a port using ss command.
-        Returns list of {"client_ip": "x.x.x.x", "connected_at": timestamp}
-        """
-        connections = []
-        try:
-            # Get established connections to this port
+def _count_active_connections() -> int:
+    """Count active VPN connections via ss."""
+    ports = [443, 8443, 8444, 8388, 51820]
+    total = 0
+    try:
+        for port in ports:
             result = subprocess.run(
                 ["ss", "-tn", "state", "established", f"sport = :{port}"],
                 capture_output=True, text=True, timeout=5
             )
-            for line in result.stdout.strip().split('\n')[1:]:  # Skip header
-                # Format: "0      0      [::ffff:109.107.181.93]:8443   [::ffff:185.154.73.227]:59648"
-                parts = line.split()
-                if len(parts) >= 4:
-                    peer = parts[3]
-                    # Extract IP from peer address
-                    # Handle both IPv4 and IPv6-mapped IPv4
-                    if "::ffff:" in peer:
-                        # IPv6-mapped IPv4: [::ffff:185.154.73.227]:59648
-                        ip_match = re.search(r'::ffff:(\d+\.\d+\.\d+\.\d+)', peer)
-                    else:
-                        # Plain IPv4: 185.154.73.227:59648
-                        ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', peer)
-                    
-                    if ip_match:
-                        client_ip = ip_match.group(1)
-                        connections.append({
-                            "client_ip": client_ip,
-                            "connected_at": time.time()
-                        })
-        except Exception as e:
-            logger.debug(f"Error parsing port {port} connections: {e}")
-        
-        return connections
-    
-    def get_connection_counts(self) -> Dict[str, int]:
-        """
-        Get connection counts for all protocols using ss.
-        Used for detecting anomalies (more connections than keys).
-        """
-        counts = {}
-        for protocol, port in PROTOCOL_PORTS.items():
-            connections = self.parse_port_connections(protocol, port)
-            counts[protocol] = len(connections)
-        return counts
-    
-    def scan_all(self):
-        # Protocols with key_id tracking
-        self.parse_xray_log()      # VLESS - from access.log
-        self.parse_wireguard()      # WireGuard - from wg show
-        self.parse_hysteria2()      # Hysteria2 - from API
-        
-        # Note: TUIC and Shadowsocks don't provide key_id in connections
-        # We track total connection counts for anomaly detection
-        
-        # Cleanup expired IP blocks
-        ip_blocker.cleanup_expired()
-
-
-tracker = ConnectionTracker()
+            lines = result.stdout.strip().split('\n')[1:]
+            total += len([l for l in lines if l.strip()])
+    except:
+        pass
+    return total
 
 # ==================== Helpers ====================
 
@@ -381,12 +120,14 @@ def require_token(f):
         return f(*args, **kwargs)
     return decorated
 
+
 def is_valid_uuid(s: str) -> bool:
     try:
         uuid.UUID(s)
         return True
     except:
         return False
+
 
 def restart_service_sync(service: str, timeout: int = 30) -> dict:
     try:
@@ -397,9 +138,11 @@ def restart_service_sync(service: str, timeout: int = 30) -> dict:
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+
 def read_json_config(path: str) -> dict:
     with open(path, 'r') as f:
         return json.load(f)
+
 
 def write_json_config(path: str, data: dict):
     if os.path.exists(path):
@@ -409,9 +152,11 @@ def write_json_config(path: str, data: dict):
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
 
+
 def read_yaml_config(path: str) -> dict:
     with open(path, 'r') as f:
         return yaml.safe_load(f)
+
 
 def write_yaml_config(path: str, data: dict):
     if os.path.exists(path):
@@ -421,56 +166,13 @@ def write_yaml_config(path: str, data: dict):
     with open(path, 'w') as f:
         yaml.dump(data, f, default_flow_style=False)
 
-def get_server_metrics() -> dict:
-    info = {"version": __version__}
-    try:
-        with open("/proc/loadavg") as f:
-            info["load_avg"] = [float(x) for x in f.read().split()[:3]]
-            info["cpu_percent"] = round(info["load_avg"][0] * 100, 1)
-        with open("/proc/meminfo") as f:
-            meminfo = {}
-            for line in f:
-                parts = line.split()
-                if parts[0] in ["MemTotal:", "MemAvailable:"]:
-                    meminfo[parts[0][:-1]] = int(parts[1])
-            total = meminfo.get("MemTotal", 0)
-            available = meminfo.get("MemAvailable", 0)
-            if total:
-                info["ram_percent"] = round((total - available) / total * 100, 1)
-    except:
-        pass
-    info["active_connections"] = tracker.get_active_count()
-    info["connections_by_protocol"] = tracker.get_active_by_protocol()
-    info["blocked_ips"] = len(ip_blocker.get_blocked_ips())
-    # Real connection counts from ss (for all protocols)
-    info["connection_counts"] = tracker.get_connection_counts()
-    return info
-
 # ==================== Command Handler ====================
 
 def handle_command(command: str, data: Dict[str, Any]) -> Dict[str, Any]:
     """Handle command from Central Manager."""
-    logger.info(f"Handling command: {command} with data: {data}")
+    logger.info(f"Command: {command}")
     
-    if command == "block_ip":
-        ip = data.get("ip")
-        duration = data.get("duration", IP_BLOCK_DURATION)
-        if ip:
-            success = ip_blocker.block_ip(ip, duration)
-            return {"success": success, "ip": ip, "duration": duration}
-        return {"success": False, "error": "No IP provided"}
-    
-    elif command == "unblock_ip":
-        ip = data.get("ip")
-        if ip:
-            success = ip_blocker.unblock_ip(ip)
-            return {"success": success, "ip": ip}
-        return {"success": False, "error": "No IP provided"}
-    
-    elif command == "get_blocked_ips":
-        return {"success": True, "blocked_ips": ip_blocker.get_blocked_ips()}
-    
-    elif command == "restart_service":
+    if command == "restart_service":
         service = data.get("service")
         if service and service in VPN_SERVICES:
             result = restart_service_sync(service)
@@ -481,7 +183,6 @@ def handle_command(command: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": True, "pong": True, "version": __version__}
     
     else:
-        logger.warning(f"Unknown command: {command}")
         return {"success": False, "error": f"Unknown command: {command}"}
 
 # ==================== Key Management Endpoints ====================
@@ -510,6 +211,7 @@ def add_vless_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/keys/vless/<client_uuid>", methods=["DELETE"])
 @require_token
 def delete_vless_key(client_uuid: str):
@@ -528,6 +230,7 @@ def delete_vless_key(client_uuid: str):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/keys/vless", methods=["GET"])
 @require_token
 def list_vless_keys():
@@ -540,6 +243,7 @@ def list_vless_keys():
         return jsonify({"error": "VLESS inbound not found"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/keys/tuic", methods=["POST"])
 @require_token
@@ -562,6 +266,7 @@ def add_tuic_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/keys/tuic/<user_uuid>", methods=["DELETE"])
 @require_token
 def delete_tuic_key(user_uuid: str):
@@ -579,6 +284,7 @@ def delete_tuic_key(user_uuid: str):
         return jsonify({"success": True, "deleted_uuid": user_uuid, "restart": restart_service_sync(TUIC_SERVICES[domain_index])})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/keys/shadowsocks", methods=["POST"])
 @require_token
@@ -601,6 +307,7 @@ def add_shadowsocks_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/keys/shadowsocks/<key_id>", methods=["DELETE"])
 @require_token
 def delete_shadowsocks_key(key_id: str):
@@ -615,6 +322,7 @@ def delete_shadowsocks_key(key_id: str):
         return jsonify({"success": True, "deleted_id": key_id, "restart": restart_service_sync("shadowsocks")})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/keys/wireguard", methods=["POST"])
 @require_token
@@ -643,6 +351,7 @@ def add_wireguard_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/keys/wireguard/<path:public_key>", methods=["DELETE"])
 @require_token
 def delete_wireguard_key(public_key: str):
@@ -659,6 +368,7 @@ def delete_wireguard_key(public_key: str):
         return jsonify({"success": True, "deleted_public_key": public_key})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/keys/hysteria2", methods=["POST"])
 @require_token
@@ -687,6 +397,7 @@ def add_hysteria2_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/keys/hysteria2/<username>", methods=["DELETE"])
 @require_token
 def delete_hysteria2_key(username: str):
@@ -708,58 +419,20 @@ def delete_hysteria2_key(username: str):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ==================== IP Blocking Endpoints ====================
-
-@app.route("/block-ip", methods=["POST"])
-@require_token
-def block_ip_endpoint():
-    """Block an IP address."""
-    data = request.get_json() or {}
-    ip = data.get("ip")
-    duration = data.get("duration", IP_BLOCK_DURATION)
-    
-    if not ip:
-        return jsonify({"error": "IP required"}), 400
-    
-    success = ip_blocker.block_ip(ip, duration)
-    return jsonify({"success": success, "ip": ip, "duration": duration})
-
-@app.route("/unblock-ip", methods=["POST"])
-@require_token
-def unblock_ip_endpoint():
-    """Unblock an IP address."""
-    data = request.get_json() or {}
-    ip = data.get("ip")
-    
-    if not ip:
-        return jsonify({"error": "IP required"}), 400
-    
-    success = ip_blocker.unblock_ip(ip)
-    return jsonify({"success": success, "ip": ip})
-
-@app.route("/blocked-ips", methods=["GET"])
-@require_token
-def get_blocked_ips_endpoint():
-    """Get list of blocked IPs."""
-    return jsonify({"blocked_ips": ip_blocker.get_blocked_ips()})
-
 # ==================== Health & Info Endpoints ====================
 
 def get_service_status(service: str) -> dict:
     try:
         result = subprocess.run(["systemctl", "is-active", service], capture_output=True, text=True, timeout=5)
-        status = result.stdout.strip()
-        info = {"service": service, "status": status}
-        if status == "active":
-            result = subprocess.run(["systemctl", "show", service, "--property=ActiveEnterTimestamp"], capture_output=True, text=True, timeout=5)
-            info["since"] = result.stdout.strip().split("=")[-1]
-        return info
+        return {"service": service, "status": result.stdout.strip()}
     except Exception as e:
         return {"service": service, "status": "error", "error": str(e)}
 
+
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"service": "VPN Key Agent", "version": __version__, "status": "running", "websocket_enabled": bool(CENTRAL_MANAGER_URL)})
+    return jsonify({"service": "VPN Key Agent", "version": __version__, "status": "running"})
+
 
 @app.route("/health", methods=["GET"])
 @require_token
@@ -771,7 +444,8 @@ def health_all():
         services[svc] = status
         if status["status"] != "active":
             all_healthy = False
-    return jsonify({"healthy": all_healthy, "services": services, "timestamp": int(time.time())})
+    return jsonify({"healthy": all_healthy, "services": services})
+
 
 @app.route("/health/<service>", methods=["GET"])
 @require_token
@@ -779,6 +453,7 @@ def health_service(service: str):
     if service not in VPN_SERVICES:
         return jsonify({"error": f"Unknown service: {service}"}), 404
     return jsonify(get_service_status(service))
+
 
 @app.route("/restart/<service>", methods=["POST"])
 @require_token
@@ -788,113 +463,55 @@ def restart(service: str):
     result = restart_service_sync(service)
     return jsonify({"service": service, **result}), 200 if result.get("success") else 500
 
-@app.route("/restart-all", methods=["POST"])
-@require_token
-def restart_all():
-    results = []
-    for svc in VPN_SERVICES:
-        status = get_service_status(svc)
-        if status["status"] != "active":
-            result = restart_service_sync(svc)
-            results.append({"service": svc, **result})
-    return jsonify({"restarted": [r["service"] for r in results if r.get("success")], "failed": [r["service"] for r in results if not r.get("success")]})
 
 @app.route("/info", methods=["GET"])
 @require_token
 def server_info():
     return jsonify(get_server_metrics())
 
-@app.route("/connections", methods=["GET"])
-@require_token
-def get_connections():
-    """Get current active connections."""
-    return jsonify({
-        "total": tracker.get_active_count(),
-        "by_protocol": tracker.get_active_by_protocol(),
-    })
-
-@app.route("/events", methods=["GET"])
-@require_token
-def get_pending_events():
-    """Get and clear pending connection events (for HTTP polling fallback)."""
-    events = tracker.get_pending_events()
-    return jsonify({
-        "count": len(events),
-        "events": [e.to_dict() for e in events],
-    })
-
 # ==================== WebSocket Mode ====================
 
 async def websocket_loop():
-    """Main WebSocket loop - connects to Central Manager and sends events."""
+    """WebSocket loop - connects to Central Manager."""
     import aiohttp
     
     if not CENTRAL_MANAGER_URL or not SERVER_ID:
-        logger.warning("WebSocket mode disabled: CENTRAL_MANAGER_URL or VPN_SERVER_ID not set")
+        logger.warning("WebSocket disabled: CENTRAL_MANAGER_URL or VPN_SERVER_ID not set")
         return
     
-    logger.info(f"Starting WebSocket mode: connecting to {CENTRAL_MANAGER_URL}")
+    logger.info(f"WebSocket connecting to {CENTRAL_MANAGER_URL}")
     
     while True:
         try:
-            # Build WebSocket URL
             ws_url = f"{CENTRAL_MANAGER_URL}/{SERVER_ID}?token={API_TOKEN}"
             
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(ws_url, heartbeat=20) as ws:
                     logger.info("Connected to Central Manager")
                     
-                    # Send handshake
                     await ws.send_json({"agent_version": __version__, "server_id": SERVER_ID})
                     
-                    # Wait for welcome
                     msg = await ws.receive_json()
                     if msg.get("type") == "welcome":
-                        logger.info(f"Registered as: {msg.get('server_name')}")
+                        logger.info(f"Registered: {msg.get('server_name')}")
                     
-                    # Main loop
                     last_heartbeat = time.time()
-                    last_scan = time.time()
                     
                     while True:
                         now = time.time()
                         
-                        # Scan logs every 5 seconds
-                        if now - last_scan >= 5:
-                            tracker.scan_all()
-                            last_scan = now
-                            
-                            # Send pending events
-                            events = tracker.get_pending_events()
-                            if events:
-                                await ws.send_json({
-                                    "type": "events",
-                                    "events": [e.to_dict() for e in events],
-                                })
-                        
-                        # Send heartbeat every 30 seconds
+                        # Heartbeat every 30s
                         if now - last_heartbeat >= 30:
                             metrics = get_server_metrics()
-                            await ws.send_json({
-                                "type": "heartbeat",
-                                "agent_version": __version__,
-                                **metrics,
-                            })
+                            await ws.send_json({"type": "heartbeat", "agent_version": __version__, **metrics})
                             last_heartbeat = now
                         
-                        # Check for incoming commands
+                        # Check commands
                         try:
-                            msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
+                            msg = await asyncio.wait_for(ws.receive_json(), timeout=5)
                             if msg.get("type") == "command":
-                                command = msg.get("command")
-                                data = msg.get("data", {})
-                                result = handle_command(command, data)
-                                # Send response
-                                await ws.send_json({
-                                    "type": "command_result",
-                                    "command": command,
-                                    "result": result,
-                                })
+                                result = handle_command(msg.get("command"), msg.get("data", {}))
+                                await ws.send_json({"type": "command_result", "command": msg.get("command"), "result": result})
                         except asyncio.TimeoutError:
                             pass
                         except Exception as e:
@@ -903,19 +520,14 @@ async def websocket_loop():
                             
         except Exception as e:
             logger.error(f"WebSocket error: {e}")
-            logger.info("Reconnecting in 10 seconds...")
+            logger.info("Reconnecting in 10s...")
             await asyncio.sleep(10)
 
 
 def run_websocket_in_thread():
-    """Run WebSocket loop in separate thread."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
-    try:
-        loop.run_until_complete(websocket_loop())
-    except Exception as e:
-        logger.error(f"WebSocket thread error: {e}")
+    loop.run_until_complete(websocket_loop())
 
 
 # ==================== Main ====================
@@ -928,14 +540,11 @@ if __name__ == "__main__":
         print("WARNING: VPN_AGENT_TOKEN not set!")
     
     print(f"VPN Key Agent v{__version__} starting on port {port}")
-    print(f"WebSocket mode: {'enabled' if websocket_mode else 'disabled'}")
-    print(f"IP blocking: enabled (iptables chain: {IPBlocker.CHAIN_NAME})")
+    print(f"WebSocket: {'enabled' if websocket_mode else 'disabled'}")
     
     if websocket_mode:
-        # Start WebSocket in background thread
         ws_thread = threading.Thread(target=run_websocket_in_thread, daemon=True)
         ws_thread.start()
         logger.info("WebSocket thread started")
     
-    # Start Flask HTTP server (for key management commands)
     app.run(host="0.0.0.0", port=port, threaded=True)
