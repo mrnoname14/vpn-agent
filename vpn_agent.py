@@ -50,7 +50,7 @@ from functools import wraps
 from collections import deque
 from flask import Flask, jsonify, request
 
-__version__ = "3.2.0"
+__version__ = "3.2.1"
 
 # ==================== Configuration ====================
 
@@ -503,7 +503,7 @@ def add_vless_key():
         for c in clients:
             if c.get("id") == client_uuid:
                 return jsonify({"success": True, "uuid": client_uuid, "flow": c.get("flow"), "existed": True})
-        clients.append({"id": client_uuid, "flow": flow})
+        clients.append({"id": client_uuid, "flow": flow, "email": client_uuid})
         vless_inbound["settings"]["clients"] = clients
         write_json_config(XRAY_CONFIG, config)
         return jsonify({"success": True, "uuid": client_uuid, "flow": flow, "restart": restart_service_sync("xray")})
