@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v3.0.0
+VPN Key Agent v3.1.0
 Enterprise VPN Agent with WebSocket connection to Central Manager.
 
 Features:
@@ -9,6 +9,7 @@ Features:
 - Real-time connection tracking via log parsing
 - Batch event sending for efficiency
 - Heartbeat with metrics
+- IP blocking for duplicate detection (iptables)
 
 Run modes:
 - WebSocket mode: Agent connects to Central Manager, sends events
@@ -44,7 +45,7 @@ from functools import wraps
 from collections import deque
 from flask import Flask, jsonify, request
 
-__version__ = "3.0.1"
+__version__ = "3.1.0"
 
 # ==================== Configuration ====================
 
@@ -70,10 +71,122 @@ VPN_SERVICES = ["hysteria", "hysteria2", "tuic", "tuic2", "xray", "shadowsocks",
 
 XRAY_ACCESS_LOG = "/var/log/xray/access.log"
 
+# IP block duration (seconds)
+IP_BLOCK_DURATION = 1800  # 30 minutes
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("vpn-agent")
 
 app = Flask(__name__)
+
+# ==================== IP Blocking ====================
+
+class IPBlocker:
+    """Manages IP blocking via iptables for duplicate detection."""
+    
+    CHAIN_NAME = "VPN_BLOCK"
+    
+    def __init__(self):
+        self._blocked_ips: Dict[str, float] = {}  # ip -> unblock_time
+        self._lock = threading.Lock()
+        self._setup_chain()
+    
+    def _setup_chain(self):
+        """Create iptables chain if not exists."""
+        try:
+            # Check if chain exists
+            result = subprocess.run(
+                ["iptables", "-L", self.CHAIN_NAME, "-n"],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                # Create chain
+                subprocess.run(["iptables", "-N", self.CHAIN_NAME], capture_output=True)
+                # Add chain to INPUT
+                subprocess.run(
+                    ["iptables", "-I", "INPUT", "-j", self.CHAIN_NAME],
+                    capture_output=True
+                )
+                logger.info(f"Created iptables chain: {self.CHAIN_NAME}")
+        except Exception as e:
+            logger.error(f"Failed to setup iptables chain: {e}")
+    
+    def block_ip(self, ip: str, duration: int = IP_BLOCK_DURATION) -> bool:
+        """Block IP for specified duration."""
+        if not self._is_valid_ip(ip):
+            logger.warning(f"Invalid IP: {ip}")
+            return False
+        
+        try:
+            with self._lock:
+                # Add iptables rule
+                result = subprocess.run(
+                    ["iptables", "-A", self.CHAIN_NAME, "-s", ip, "-j", "DROP"],
+                    capture_output=True, text=True
+                )
+                
+                if result.returncode == 0:
+                    self._blocked_ips[ip] = time.time() + duration
+                    logger.info(f"Blocked IP: {ip} for {duration}s")
+                    return True
+                else:
+                    logger.error(f"Failed to block IP {ip}: {result.stderr}")
+                    return False
+        except Exception as e:
+            logger.error(f"Error blocking IP {ip}: {e}")
+            return False
+    
+    def unblock_ip(self, ip: str) -> bool:
+        """Unblock IP."""
+        if not self._is_valid_ip(ip):
+            return False
+        
+        try:
+            with self._lock:
+                # Remove iptables rule
+                result = subprocess.run(
+                    ["iptables", "-D", self.CHAIN_NAME, "-s", ip, "-j", "DROP"],
+                    capture_output=True, text=True
+                )
+                
+                if ip in self._blocked_ips:
+                    del self._blocked_ips[ip]
+                
+                if result.returncode == 0:
+                    logger.info(f"Unblocked IP: {ip}")
+                    return True
+                return False
+        except Exception as e:
+            logger.error(f"Error unblocking IP {ip}: {e}")
+            return False
+    
+    def cleanup_expired(self):
+        """Remove expired blocks."""
+        now = time.time()
+        expired = [ip for ip, unblock_time in self._blocked_ips.items() if now >= unblock_time]
+        for ip in expired:
+            self.unblock_ip(ip)
+    
+    def get_blocked_ips(self) -> List[Dict[str, Any]]:
+        """Get list of blocked IPs with remaining time."""
+        now = time.time()
+        with self._lock:
+            return [
+                {"ip": ip, "remaining_seconds": int(unblock_time - now)}
+                for ip, unblock_time in self._blocked_ips.items()
+                if unblock_time > now
+            ]
+    
+    def _is_valid_ip(self, ip: str) -> bool:
+        """Validate IP address."""
+        try:
+            parts = ip.split('.')
+            return len(parts) == 4 and all(0 <= int(p) <= 255 for p in parts)
+        except:
+            return False
+
+
+ip_blocker = IPBlocker()
 
 # ==================== Connection Tracking ====================
 
@@ -159,6 +272,8 @@ class ConnectionTracker:
     def scan_all(self):
         self.parse_xray_log()
         self.parse_wireguard()
+        # Cleanup expired IP blocks
+        ip_blocker.cleanup_expired()
 
 
 tracker = ConnectionTracker()
@@ -235,8 +350,48 @@ def get_server_metrics() -> dict:
         pass
     info["active_connections"] = tracker.get_active_count()
     info["connections_by_protocol"] = tracker.get_active_by_protocol()
+    info["blocked_ips"] = len(ip_blocker.get_blocked_ips())
     return info
-# ==================== Key Management Endpoints (continued from part1) ====================
+
+# ==================== Command Handler ====================
+
+def handle_command(command: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle command from Central Manager."""
+    logger.info(f"Handling command: {command} with data: {data}")
+    
+    if command == "block_ip":
+        ip = data.get("ip")
+        duration = data.get("duration", IP_BLOCK_DURATION)
+        if ip:
+            success = ip_blocker.block_ip(ip, duration)
+            return {"success": success, "ip": ip, "duration": duration}
+        return {"success": False, "error": "No IP provided"}
+    
+    elif command == "unblock_ip":
+        ip = data.get("ip")
+        if ip:
+            success = ip_blocker.unblock_ip(ip)
+            return {"success": success, "ip": ip}
+        return {"success": False, "error": "No IP provided"}
+    
+    elif command == "get_blocked_ips":
+        return {"success": True, "blocked_ips": ip_blocker.get_blocked_ips()}
+    
+    elif command == "restart_service":
+        service = data.get("service")
+        if service and service in VPN_SERVICES:
+            result = restart_service_sync(service)
+            return {"success": result.get("success", False), "service": service, **result}
+        return {"success": False, "error": f"Invalid service: {service}"}
+    
+    elif command == "ping":
+        return {"success": True, "pong": True, "version": __version__}
+    
+    else:
+        logger.warning(f"Unknown command: {command}")
+        return {"success": False, "error": f"Unknown command: {command}"}
+
+# ==================== Key Management Endpoints ====================
 
 @app.route("/keys/vless", methods=["POST"])
 @require_token
@@ -459,7 +614,43 @@ def delete_hysteria2_key(username: str):
         return jsonify({"success": True, "deleted_username": username, "restart": restart_service_sync(HYSTERIA_SERVICES[domain_index])})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-# ==================== Health & Info Endpoints (continued) ====================
+
+# ==================== IP Blocking Endpoints ====================
+
+@app.route("/block-ip", methods=["POST"])
+@require_token
+def block_ip_endpoint():
+    """Block an IP address."""
+    data = request.get_json() or {}
+    ip = data.get("ip")
+    duration = data.get("duration", IP_BLOCK_DURATION)
+    
+    if not ip:
+        return jsonify({"error": "IP required"}), 400
+    
+    success = ip_blocker.block_ip(ip, duration)
+    return jsonify({"success": success, "ip": ip, "duration": duration})
+
+@app.route("/unblock-ip", methods=["POST"])
+@require_token
+def unblock_ip_endpoint():
+    """Unblock an IP address."""
+    data = request.get_json() or {}
+    ip = data.get("ip")
+    
+    if not ip:
+        return jsonify({"error": "IP required"}), 400
+    
+    success = ip_blocker.unblock_ip(ip)
+    return jsonify({"success": success, "ip": ip})
+
+@app.route("/blocked-ips", methods=["GET"])
+@require_token
+def get_blocked_ips_endpoint():
+    """Get list of blocked IPs."""
+    return jsonify({"blocked_ips": ip_blocker.get_blocked_ips()})
+
+# ==================== Health & Info Endpoints ====================
 
 def get_service_status(service: str) -> dict:
     try:
@@ -602,8 +793,15 @@ async def websocket_loop():
                         try:
                             msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
                             if msg.get("type") == "command":
-                                logger.info(f"Received command: {msg.get('command')}")
-                                # Handle commands here
+                                command = msg.get("command")
+                                data = msg.get("data", {})
+                                result = handle_command(command, data)
+                                # Send response
+                                await ws.send_json({
+                                    "type": "command_result",
+                                    "command": command,
+                                    "result": result,
+                                })
                         except asyncio.TimeoutError:
                             pass
                         except Exception as e:
@@ -618,8 +816,6 @@ async def websocket_loop():
 
 def run_websocket_in_thread():
     """Run WebSocket loop in separate thread."""
-    import asyncio
-    
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
@@ -640,6 +836,7 @@ if __name__ == "__main__":
     
     print(f"VPN Key Agent v{__version__} starting on port {port}")
     print(f"WebSocket mode: {'enabled' if websocket_mode else 'disabled'}")
+    print(f"IP blocking: enabled (iptables chain: {IPBlocker.CHAIN_NAME})")
     
     if websocket_mode:
         # Start WebSocket in background thread
