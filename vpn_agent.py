@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v3.1.0
+VPN Key Agent v3.2.0
 Enterprise VPN Agent with WebSocket connection to Central Manager.
 
 Features:
 - WebSocket connection to Central Manager (primary)
 - HTTP fallback for key management
-- Real-time connection tracking via log parsing
+- Real-time connection tracking for ALL 5 protocols:
+  * VLESS (xray) - via access.log parsing
+  * WireGuard - via wg show command
+  * Hysteria2 - via trafficStats API
+  * TUIC - via ss port monitoring
+  * Shadowsocks - via ss port monitoring
 - Batch event sending for efficiency
-- Heartbeat with metrics
+- Heartbeat with metrics and connection counts
 - IP blocking for duplicate detection (iptables)
 
 Run modes:
@@ -45,7 +50,7 @@ from functools import wraps
 from collections import deque
 from flask import Flask, jsonify, request
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 # ==================== Configuration ====================
 
@@ -70,6 +75,19 @@ HYSTERIA_SERVICES = ["hysteria", "hysteria2"]
 VPN_SERVICES = ["hysteria", "hysteria2", "tuic", "tuic2", "xray", "shadowsocks", "wg-quick@wg0", "AdGuardHome"]
 
 XRAY_ACCESS_LOG = "/var/log/xray/access.log"
+
+# Hysteria2 trafficStats API
+HYSTERIA_API_URL = "http://127.0.0.1:9999"
+HYSTERIA_API_SECRET = os.environ.get("HYSTERIA_API_SECRET", "agent_stats_token_2024")
+
+# Port mapping for protocols (for ss-based tracking)
+PROTOCOL_PORTS = {
+    "vless": 443,
+    "hysteria2": 8443,
+    "tuic": 8444,
+    "shadowsocks": 8388,
+    "wireguard": 51820,
+}
 
 # IP block duration (seconds)
 IP_BLOCK_DURATION = 1800  # 30 minutes
@@ -269,9 +287,82 @@ class ConnectionTracker:
         except Exception:
             pass
     
+    def parse_hysteria2(self):
+        """Parse Hysteria2 trafficStats API to get active connections."""
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                f"{HYSTERIA_API_URL}/online",
+                headers={"Authorization": HYSTERIA_API_SECRET}
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                # Response format: {"username1": {"tx": 123, "rx": 456}, ...}
+                for username, stats in data.items():
+                    # We don't have IP from API, but we can track the connection
+                    # For now, use a placeholder - we'll get real IP from ss
+                    self.track_connection("hysteria2", username, "api")
+        except Exception as e:
+            if "urlopen" not in str(e.__class__.__name__).lower():
+                logger.debug(f"Hysteria2 API error: {e}")
+    
+    def parse_port_connections(self, protocol: str, port: int) -> List[Dict[str, Any]]:
+        """
+        Parse active connections on a port using ss command.
+        Returns list of {"client_ip": "x.x.x.x", "connected_at": timestamp}
+        """
+        connections = []
+        try:
+            # Get established connections to this port
+            result = subprocess.run(
+                ["ss", "-tn", "state", "established", f"sport = :{port}"],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.strip().split('\n')[1:]:  # Skip header
+                # Format: "0      0      [::ffff:109.107.181.93]:8443   [::ffff:185.154.73.227]:59648"
+                parts = line.split()
+                if len(parts) >= 4:
+                    peer = parts[3]
+                    # Extract IP from peer address
+                    # Handle both IPv4 and IPv6-mapped IPv4
+                    if "::ffff:" in peer:
+                        # IPv6-mapped IPv4: [::ffff:185.154.73.227]:59648
+                        ip_match = re.search(r'::ffff:(\d+\.\d+\.\d+\.\d+)', peer)
+                    else:
+                        # Plain IPv4: 185.154.73.227:59648
+                        ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', peer)
+                    
+                    if ip_match:
+                        client_ip = ip_match.group(1)
+                        connections.append({
+                            "client_ip": client_ip,
+                            "connected_at": time.time()
+                        })
+        except Exception as e:
+            logger.debug(f"Error parsing port {port} connections: {e}")
+        
+        return connections
+    
+    def get_connection_counts(self) -> Dict[str, int]:
+        """
+        Get connection counts for all protocols using ss.
+        Used for detecting anomalies (more connections than keys).
+        """
+        counts = {}
+        for protocol, port in PROTOCOL_PORTS.items():
+            connections = self.parse_port_connections(protocol, port)
+            counts[protocol] = len(connections)
+        return counts
+    
     def scan_all(self):
-        self.parse_xray_log()
-        self.parse_wireguard()
+        # Protocols with key_id tracking
+        self.parse_xray_log()      # VLESS - from access.log
+        self.parse_wireguard()      # WireGuard - from wg show
+        self.parse_hysteria2()      # Hysteria2 - from API
+        
+        # Note: TUIC and Shadowsocks don't provide key_id in connections
+        # We track total connection counts for anomaly detection
+        
         # Cleanup expired IP blocks
         ip_blocker.cleanup_expired()
 
@@ -351,6 +442,8 @@ def get_server_metrics() -> dict:
     info["active_connections"] = tracker.get_active_count()
     info["connections_by_protocol"] = tracker.get_active_by_protocol()
     info["blocked_ips"] = len(ip_blocker.get_blocked_ips())
+    # Real connection counts from ss (for all protocols)
+    info["connection_counts"] = tracker.get_connection_counts()
     return info
 
 # ==================== Command Handler ====================
