@@ -36,7 +36,7 @@ from typing import Dict, List, Optional, Any
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "3.3.0"
+__version__ = "3.4.0"
 
 # ==================== Configuration ====================
 

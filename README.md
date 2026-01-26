@@ -1,4 +1,4 @@
-# VPN Key Agent v3.3.0
+# VPN Key Agent v3.4.0
 
 Lightweight agent for managing VPN keys on servers.
 
@@ -58,7 +58,7 @@ python vpn_agent.py --websocket
 
 ## Releases
 
-- v3.3.0 - Simplified (removed IPBlocker, ConnectionTracker)
+- v3.4.0 - Simplified (removed IPBlocker, ConnectionTracker)
 - v3.2.2 - All protocol parsing
 - v3.0.1 - WebSocket support
 - v2.0.4 - Multi-domain support
