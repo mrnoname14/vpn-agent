@@ -50,7 +50,7 @@ from functools import wraps
 from collections import deque
 from flask import Flask, jsonify, request
 
-__version__ = "3.2.1"
+__version__ = "3.2.2"
 
 # ==================== Configuration ====================
 
@@ -268,7 +268,7 @@ class ConnectionTracker:
                     last_pos = 0
                 f.seek(last_pos)
                 for line in f:
-                    match = re.search(r'from:(\d+\.\d+\.\d+\.\d+):\d+.*?email:([a-f0-9-]{36})', line, re.IGNORECASE)
+                    match = re.search(r'from[:\s]+([\d.]+):\d+.*?email[:\s]+([a-f0-9-]{36})', line, re.IGNORECASE)
                     if match:
                         self.track_connection("vless", match.group(2), match.group(1))
                 self._log_positions[XRAY_ACCESS_LOG] = f.tell()
