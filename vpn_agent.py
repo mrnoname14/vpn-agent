@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v3.5.0 (Sync Support)
+VPN Key Agent v3.6.0 (Dummy User Support)
 
-Changes from v3.4.0:
-- Added GET endpoints for all protocols (for sync)
-- /keys/tuic GET - list TUIC users
-- /keys/hysteria2 GET - list Hysteria2 users
-- /keys/shadowsocks GET - list Shadowsocks keys
-- /keys/wireguard GET - list WireGuard peers
+Changes from v3.5.0:
+- Added dummy user support for Hysteria2 and TUIC
+- When last real user is deleted, dummy user is added automatically
+- When first real user is added, dummy user is removed
+- Prevents services from crashing with empty config
 
 Features:
 - WebSocket connection to Central Manager
@@ -15,6 +14,7 @@ Features:
 - Heartbeat with metrics (CPU, RAM, connections)
 - Key management for all 5 protocols
 - Full key listing for sync operations
+- Dummy user management for empty configs
 
 Usage:
   python vpn_agent.py                    # HTTP mode only
@@ -39,7 +39,13 @@ from typing import Dict, List, Optional, Any
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "3.5.0"
+__version__ = "3.6.0"
+
+# Dummy users - added when config is empty to prevent service crash
+DUMMY_HYSTERIA_USER = "_dummy_"
+DUMMY_HYSTERIA_PASS = "_dummy_placeholder_do_not_use_"
+DUMMY_TUIC_UUID = "00000000-0000-0000-0000-000000000000"
+DUMMY_TUIC_PASS = "_dummy_placeholder_"
 
 # ==================== Configuration ====================
 
@@ -269,18 +275,20 @@ def delete_vless_key(client_uuid: str):
 @app.route("/keys/tuic", methods=["GET"])
 @require_token
 def list_tuic_keys():
-    """List all TUIC users. Use ?domain_index=0 or ?domain_index=1"""
+    """List all TUIC users. Use ?domain_index=0 or ?domain_index=1. Excludes dummy user."""
     domain_index = request.args.get("domain_index", 0, type=int)
     if domain_index < 0 or domain_index >= len(TUIC_CONFIGS):
         return jsonify({"error": "Invalid domain_index"}), 400
     try:
         config = read_json_config(TUIC_CONFIGS[domain_index])
         users = config.get("users", {})
+        # Exclude dummy user from count and list
+        real_users = {k: v for k, v in users.items() if k != DUMMY_TUIC_UUID}
         return jsonify({
             "protocol": "tuic",
             "domain_index": domain_index,
-            "count": len(users),
-            "users": users  # {uuid: password}
+            "count": len(real_users),
+            "users": real_users
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -289,6 +297,7 @@ def list_tuic_keys():
 @app.route("/keys/tuic", methods=["POST"])
 @require_token
 def add_tuic_key():
+    """Add TUIC user. Removes dummy user if present."""
     data = request.get_json() or {}
     user_uuid = data.get("uuid") or str(uuid.uuid4())
     password = data.get("password") or base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip('=')
@@ -300,6 +309,10 @@ def add_tuic_key():
         users = config.get("users", {})
         if user_uuid in users:
             return jsonify({"success": True, "uuid": user_uuid, "password": users[user_uuid], "existed": True})
+        # Remove dummy user if present (first real user being added)
+        if DUMMY_TUIC_UUID in users:
+            del users[DUMMY_TUIC_UUID]
+            logger.info(f"Removed dummy TUIC user from domain {domain_index}")
         users[user_uuid] = password
         config["users"] = users
         write_json_config(TUIC_CONFIGS[domain_index], config)
@@ -311,6 +324,7 @@ def add_tuic_key():
 @app.route("/keys/tuic/<user_uuid>", methods=["DELETE"])
 @require_token
 def delete_tuic_key(user_uuid: str):
+    """Delete TUIC user. Adds dummy user if last real user is deleted."""
     domain_index = request.args.get("domain_index", 0, type=int)
     if domain_index < 0 or domain_index >= len(TUIC_CONFIGS):
         return jsonify({"error": "Invalid domain_index"}), 400
@@ -320,6 +334,11 @@ def delete_tuic_key(user_uuid: str):
         if user_uuid not in users:
             return jsonify({"error": "UUID not found"}), 404
         del users[user_uuid]
+        # If no real users left, add dummy to prevent service crash
+        real_users = {k: v for k, v in users.items() if k != DUMMY_TUIC_UUID}
+        if len(real_users) == 0:
+            users[DUMMY_TUIC_UUID] = DUMMY_TUIC_PASS
+            logger.info(f"Added dummy TUIC user to domain {domain_index} (last user deleted)")
         config["users"] = users
         write_json_config(TUIC_CONFIGS[domain_index], config)
         return jsonify({"success": True, "deleted_uuid": user_uuid, "restart": restart_service_sync(TUIC_SERVICES[domain_index])})
@@ -331,7 +350,7 @@ def delete_tuic_key(user_uuid: str):
 @app.route("/keys/hysteria2", methods=["GET"])
 @require_token
 def list_hysteria2_keys():
-    """List all Hysteria2 users. Use ?domain_index=0 or ?domain_index=1"""
+    """List all Hysteria2 users. Use ?domain_index=0 or ?domain_index=1. Excludes dummy user."""
     domain_index = request.args.get("domain_index", 0, type=int)
     if domain_index < 0 or domain_index >= len(HYSTERIA_CONFIGS):
         return jsonify({"error": "Invalid domain_index"}), 400
@@ -342,11 +361,13 @@ def list_hysteria2_keys():
             users = auth.get("userpass", {})
         else:
             users = {}
+        # Exclude dummy user from count and list
+        real_users = {k: v for k, v in users.items() if k != DUMMY_HYSTERIA_USER}
         return jsonify({
             "protocol": "hysteria2",
             "domain_index": domain_index,
-            "count": len(users),
-            "users": users  # {username: password}
+            "count": len(real_users),
+            "users": real_users
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -355,6 +376,7 @@ def list_hysteria2_keys():
 @app.route("/keys/hysteria2", methods=["POST"])
 @require_token
 def add_hysteria2_key():
+    """Add Hysteria2 user. Removes dummy user if present."""
     data = request.get_json() or {}
     username = data.get("username") or f"user{int(time.time())}"
     password = data.get("password") or secrets.token_urlsafe(16)
@@ -370,6 +392,10 @@ def add_hysteria2_key():
             userpass = auth.get("userpass", {})
             if username in userpass:
                 return jsonify({"success": True, "username": username, "password": userpass[username], "existed": True})
+            # Remove dummy user if present (first real user being added)
+            if DUMMY_HYSTERIA_USER in userpass:
+                del userpass[DUMMY_HYSTERIA_USER]
+                logger.info(f"Removed dummy Hysteria2 user from domain {domain_index}")
             userpass[username] = password
             config["auth"]["userpass"] = userpass
         else:
@@ -383,6 +409,7 @@ def add_hysteria2_key():
 @app.route("/keys/hysteria2/<username>", methods=["DELETE"])
 @require_token
 def delete_hysteria2_key(username: str):
+    """Delete Hysteria2 user. Adds dummy user if last real user is deleted."""
     domain_index = request.args.get("domain_index", 0, type=int)
     if domain_index < 0 or domain_index >= len(HYSTERIA_CONFIGS):
         return jsonify({"error": "Invalid domain_index"}), 400
@@ -395,6 +422,11 @@ def delete_hysteria2_key(username: str):
         if username not in userpass:
             return jsonify({"error": "Username not found"}), 404
         del userpass[username]
+        # If no real users left, add dummy to prevent service crash
+        real_users = {k: v for k, v in userpass.items() if k != DUMMY_HYSTERIA_USER}
+        if len(real_users) == 0:
+            userpass[DUMMY_HYSTERIA_USER] = DUMMY_HYSTERIA_PASS
+            logger.info(f"Added dummy Hysteria2 user to domain {domain_index} (last user deleted)")
         config["auth"]["userpass"] = userpass
         write_yaml_config(HYSTERIA_CONFIGS[domain_index], config)
         return jsonify({"success": True, "deleted_username": username, "restart": restart_service_sync(HYSTERIA_SERVICES[domain_index])})
