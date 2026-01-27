@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v3.3.0 (Simplified)
+VPN Key Agent v3.5.0 (Sync Support)
 
-Changes from v3.2.x:
-- Removed IPBlocker (duplicate detection moved to API fingerprint_service)
-- Simplified ConnectionTracker (metrics only)
-- Cleaner codebase
+Changes from v3.4.0:
+- Added GET endpoints for all protocols (for sync)
+- /keys/tuic GET - list TUIC users
+- /keys/hysteria2 GET - list Hysteria2 users
+- /keys/shadowsocks GET - list Shadowsocks keys
+- /keys/wireguard GET - list WireGuard peers
 
 Features:
 - WebSocket connection to Central Manager
 - HTTP API for key management
 - Heartbeat with metrics (CPU, RAM, connections)
 - Key management for all 5 protocols
+- Full key listing for sync operations
 
 Usage:
   python vpn_agent.py                    # HTTP mode only
@@ -36,7 +39,7 @@ from typing import Dict, List, Optional, Any
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "3.4.0"
+__version__ = "3.5.0"
 
 # ==================== Configuration ====================
 
@@ -140,8 +143,14 @@ def restart_service_sync(service: str, timeout: int = 30) -> dict:
 
 
 def read_json_config(path: str) -> dict:
-    with open(path, 'r') as f:
-        return json.load(f)
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.error(f"Error reading {path}: {e}")
+        return {}
 
 
 def write_json_config(path: str, data: dict):
@@ -154,8 +163,14 @@ def write_json_config(path: str, data: dict):
 
 
 def read_yaml_config(path: str) -> dict:
-    with open(path, 'r') as f:
-        return yaml.safe_load(f)
+    try:
+        with open(path, 'r') as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.error(f"Error reading {path}: {e}")
+        return {}
 
 
 def write_yaml_config(path: str, data: dict):
@@ -185,7 +200,26 @@ def handle_command(command: str, data: Dict[str, Any]) -> Dict[str, Any]:
     else:
         return {"success": False, "error": f"Unknown command: {command}"}
 
-# ==================== Key Management Endpoints ====================
+# ==================== VLESS Endpoints ====================
+
+@app.route("/keys/vless", methods=["GET"])
+@require_token
+def list_vless_keys():
+    """List all VLESS clients."""
+    try:
+        config = read_json_config(XRAY_CONFIG)
+        for i in config.get("inbounds", []):
+            if i.get("protocol") == "vless":
+                clients = i.get("settings", {}).get("clients", [])
+                return jsonify({
+                    "protocol": "vless",
+                    "count": len(clients),
+                    "clients": [{"uuid": c.get("id"), "flow": c.get("flow")} for c in clients]
+                })
+        return jsonify({"protocol": "vless", "count": 0, "clients": []})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/keys/vless", methods=["POST"])
 @require_token
@@ -230,17 +264,24 @@ def delete_vless_key(client_uuid: str):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ==================== TUIC Endpoints ====================
 
-@app.route("/keys/vless", methods=["GET"])
+@app.route("/keys/tuic", methods=["GET"])
 @require_token
-def list_vless_keys():
+def list_tuic_keys():
+    """List all TUIC users. Use ?domain_index=0 or ?domain_index=1"""
+    domain_index = request.args.get("domain_index", 0, type=int)
+    if domain_index < 0 or domain_index >= len(TUIC_CONFIGS):
+        return jsonify({"error": "Invalid domain_index"}), 400
     try:
-        config = read_json_config(XRAY_CONFIG)
-        for i in config.get("inbounds", []):
-            if i.get("protocol") == "vless":
-                clients = i.get("settings", {}).get("clients", [])
-                return jsonify({"protocol": "vless", "count": len(clients), "clients": [{"uuid": c.get("id"), "flow": c.get("flow")} for c in clients]})
-        return jsonify({"error": "VLESS inbound not found"}), 500
+        config = read_json_config(TUIC_CONFIGS[domain_index])
+        users = config.get("users", {})
+        return jsonify({
+            "protocol": "tuic",
+            "domain_index": domain_index,
+            "count": len(users),
+            "users": users  # {uuid: password}
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -285,87 +326,28 @@ def delete_tuic_key(user_uuid: str):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ==================== Hysteria2 Endpoints ====================
 
-@app.route("/keys/shadowsocks", methods=["POST"])
+@app.route("/keys/hysteria2", methods=["GET"])
 @require_token
-def add_shadowsocks_key():
-    data = request.get_json() or {}
-    key_id = data.get("id") or f"user{int(time.time())}"
-    port = data.get("port", 8388)
-    cipher = data.get("cipher", "chacha20-ietf-poly1305")
-    secret = data.get("secret") or secrets.token_urlsafe(32)
+def list_hysteria2_keys():
+    """List all Hysteria2 users. Use ?domain_index=0 or ?domain_index=1"""
+    domain_index = request.args.get("domain_index", 0, type=int)
+    if domain_index < 0 or domain_index >= len(HYSTERIA_CONFIGS):
+        return jsonify({"error": "Invalid domain_index"}), 400
     try:
-        config = read_yaml_config(SS_CONFIG)
-        keys = config.get("keys", [])
-        for k in keys:
-            if k.get("id") == key_id:
-                return jsonify({"success": True, "id": key_id, "secret": k.get("secret"), "existed": True})
-        keys.append({"id": key_id, "port": port, "cipher": cipher, "secret": secret})
-        config["keys"] = keys
-        write_yaml_config(SS_CONFIG, config)
-        return jsonify({"success": True, "id": key_id, "port": port, "cipher": cipher, "secret": secret, "restart": restart_service_sync("shadowsocks")})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/keys/shadowsocks/<key_id>", methods=["DELETE"])
-@require_token
-def delete_shadowsocks_key(key_id: str):
-    try:
-        config = read_yaml_config(SS_CONFIG)
-        keys = config.get("keys", [])
-        new_keys = [k for k in keys if k.get("id") != key_id]
-        if len(new_keys) == len(keys):
-            return jsonify({"error": "Key ID not found"}), 404
-        config["keys"] = new_keys
-        write_yaml_config(SS_CONFIG, config)
-        return jsonify({"success": True, "deleted_id": key_id, "restart": restart_service_sync("shadowsocks")})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/keys/wireguard", methods=["POST"])
-@require_token
-def add_wireguard_key():
-    data = request.get_json() or {}
-    try:
-        with open(WG_CONFIG, 'r') as f:
-            config_content = f.read()
-        if data.get("public_key"):
-            public_key, private_key = data["public_key"], data.get("private_key", "")
+        config = read_yaml_config(HYSTERIA_CONFIGS[domain_index])
+        auth = config.get("auth", {})
+        if auth.get("type") == "userpass":
+            users = auth.get("userpass", {})
         else:
-            result = subprocess.run(["wg", "genkey"], capture_output=True, text=True)
-            private_key = result.stdout.strip()
-            result = subprocess.run(["wg", "pubkey"], input=private_key, capture_output=True, text=True)
-            public_key = result.stdout.strip()
-        if public_key in config_content:
-            match = re.search(rf'PublicKey\s*=\s*{re.escape(public_key)}[\s\S]*?AllowedIPs\s*=\s*(\S+)', config_content)
-            return jsonify({"success": True, "public_key": public_key, "private_key": private_key, "client_ip": match.group(1).replace('/32', '') if match else None, "existed": True})
-        ips = re.findall(r'AllowedIPs\s*=\s*10\.66\.66\.(\d+)/32', config_content)
-        used = set(int(ip) for ip in ips)
-        client_ip = next(f"10.66.66.{i}" for i in range(2, 255) if i not in used)
-        with open(WG_CONFIG, 'a') as f:
-            f.write(f"\n[Peer]\nPublicKey = {public_key}\nAllowedIPs = {client_ip}/32\n")
-        subprocess.run(["wg", "syncconf", "wg0", "/dev/stdin"], input=subprocess.run(["wg-quick", "strip", "wg0"], capture_output=True, text=True).stdout, capture_output=True, text=True)
-        return jsonify({"success": True, "public_key": public_key, "private_key": private_key, "client_ip": client_ip})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/keys/wireguard/<path:public_key>", methods=["DELETE"])
-@require_token
-def delete_wireguard_key(public_key: str):
-    try:
-        with open(WG_CONFIG, 'r') as f:
-            config_content = f.read()
-        if public_key not in config_content:
-            return jsonify({"error": "Public key not found"}), 404
-        pattern = rf'\[Peer\]\s*\n(?:.*\n)*?PublicKey\s*=\s*{re.escape(public_key)}\s*\n(?:.*\n)*?(?=\[|$)'
-        new_content = re.sub(pattern, '', config_content)
-        with open(WG_CONFIG, 'w') as f:
-            f.write(new_content)
-        subprocess.run(["wg", "syncconf", "wg0", "/dev/stdin"], input=subprocess.run(["wg-quick", "strip", "wg0"], capture_output=True, text=True).stdout, capture_output=True, text=True)
-        return jsonify({"success": True, "deleted_public_key": public_key})
+            users = {}
+        return jsonify({
+            "protocol": "hysteria2",
+            "domain_index": domain_index,
+            "count": len(users),
+            "users": users  # {username: password}
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -416,6 +398,139 @@ def delete_hysteria2_key(username: str):
         config["auth"]["userpass"] = userpass
         write_yaml_config(HYSTERIA_CONFIGS[domain_index], config)
         return jsonify({"success": True, "deleted_username": username, "restart": restart_service_sync(HYSTERIA_SERVICES[domain_index])})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ==================== Shadowsocks Endpoints ====================
+
+@app.route("/keys/shadowsocks", methods=["GET"])
+@require_token
+def list_shadowsocks_keys():
+    """List all Shadowsocks keys."""
+    try:
+        config = read_yaml_config(SS_CONFIG)
+        keys = config.get("keys", [])
+        return jsonify({
+            "protocol": "shadowsocks",
+            "count": len(keys),
+            "keys": [{"id": k.get("id"), "port": k.get("port"), "cipher": k.get("cipher")} for k in keys]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/shadowsocks", methods=["POST"])
+@require_token
+def add_shadowsocks_key():
+    data = request.get_json() or {}
+    key_id = data.get("id") or f"user{int(time.time())}"
+    port = data.get("port", 8388)
+    cipher = data.get("cipher", "chacha20-ietf-poly1305")
+    secret = data.get("secret") or secrets.token_urlsafe(32)
+    try:
+        config = read_yaml_config(SS_CONFIG)
+        keys = config.get("keys", [])
+        for k in keys:
+            if k.get("id") == key_id:
+                return jsonify({"success": True, "id": key_id, "secret": k.get("secret"), "existed": True})
+        keys.append({"id": key_id, "port": port, "cipher": cipher, "secret": secret})
+        config["keys"] = keys
+        write_yaml_config(SS_CONFIG, config)
+        return jsonify({"success": True, "id": key_id, "port": port, "cipher": cipher, "secret": secret, "restart": restart_service_sync("shadowsocks")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/shadowsocks/<key_id>", methods=["DELETE"])
+@require_token
+def delete_shadowsocks_key(key_id: str):
+    try:
+        config = read_yaml_config(SS_CONFIG)
+        keys = config.get("keys", [])
+        new_keys = [k for k in keys if k.get("id") != key_id]
+        if len(new_keys) == len(keys):
+            return jsonify({"error": "Key ID not found"}), 404
+        config["keys"] = new_keys
+        write_yaml_config(SS_CONFIG, config)
+        return jsonify({"success": True, "deleted_id": key_id, "restart": restart_service_sync("shadowsocks")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ==================== WireGuard Endpoints ====================
+
+@app.route("/keys/wireguard", methods=["GET"])
+@require_token
+def list_wireguard_keys():
+    """List all WireGuard peers."""
+    try:
+        with open(WG_CONFIG, 'r') as f:
+            config_content = f.read()
+        
+        # Parse peers
+        peers = []
+        peer_blocks = re.findall(r'\[Peer\](.*?)(?=\[|\Z)', config_content, re.DOTALL)
+        for block in peer_blocks:
+            public_key = re.search(r'PublicKey\s*=\s*(\S+)', block)
+            allowed_ips = re.search(r'AllowedIPs\s*=\s*(\S+)', block)
+            if public_key:
+                peers.append({
+                    "public_key": public_key.group(1),
+                    "allowed_ips": allowed_ips.group(1) if allowed_ips else None
+                })
+        
+        return jsonify({
+            "protocol": "wireguard",
+            "count": len(peers),
+            "peers": peers
+        })
+    except FileNotFoundError:
+        return jsonify({"protocol": "wireguard", "count": 0, "peers": []})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/wireguard", methods=["POST"])
+@require_token
+def add_wireguard_key():
+    data = request.get_json() or {}
+    try:
+        with open(WG_CONFIG, 'r') as f:
+            config_content = f.read()
+        if data.get("public_key"):
+            public_key, private_key = data["public_key"], data.get("private_key", "")
+        else:
+            result = subprocess.run(["wg", "genkey"], capture_output=True, text=True)
+            private_key = result.stdout.strip()
+            result = subprocess.run(["wg", "pubkey"], input=private_key, capture_output=True, text=True)
+            public_key = result.stdout.strip()
+        if public_key in config_content:
+            match = re.search(rf'PublicKey\s*=\s*{re.escape(public_key)}[\s\S]*?AllowedIPs\s*=\s*(\S+)', config_content)
+            return jsonify({"success": True, "public_key": public_key, "private_key": private_key, "client_ip": match.group(1).replace('/32', '') if match else None, "existed": True})
+        ips = re.findall(r'AllowedIPs\s*=\s*10\.66\.66\.(\d+)/32', config_content)
+        used = set(int(ip) for ip in ips)
+        client_ip = next(f"10.66.66.{i}" for i in range(2, 255) if i not in used)
+        with open(WG_CONFIG, 'a') as f:
+            f.write(f"\n[Peer]\nPublicKey = {public_key}\nAllowedIPs = {client_ip}/32\n")
+        subprocess.run(["wg", "syncconf", "wg0", "/dev/stdin"], input=subprocess.run(["wg-quick", "strip", "wg0"], capture_output=True, text=True).stdout, capture_output=True, text=True)
+        return jsonify({"success": True, "public_key": public_key, "private_key": private_key, "client_ip": client_ip})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/keys/wireguard/<path:public_key>", methods=["DELETE"])
+@require_token
+def delete_wireguard_key(public_key: str):
+    try:
+        with open(WG_CONFIG, 'r') as f:
+            config_content = f.read()
+        if public_key not in config_content:
+            return jsonify({"error": "Public key not found"}), 404
+        pattern = rf'\[Peer\]\s*\n(?:.*\n)*?PublicKey\s*=\s*{re.escape(public_key)}\s*\n(?:.*\n)*?(?=\[|$)'
+        new_content = re.sub(pattern, '', config_content)
+        with open(WG_CONFIG, 'w') as f:
+            f.write(new_content)
+        subprocess.run(["wg", "syncconf", "wg0", "/dev/stdin"], input=subprocess.run(["wg-quick", "strip", "wg0"], capture_output=True, text=True).stdout, capture_output=True, text=True)
+        return jsonify({"success": True, "deleted_public_key": public_key})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
