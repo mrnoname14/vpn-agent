@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v2.0.0
+VPN Key Agent v3.9.0
 Extended VPN Health Agent with key management for multi-user support.
 
 New Endpoints:
@@ -23,6 +23,10 @@ Original Endpoints (from v1.3):
   POST /restart/{svc} - restart a service
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
+
+v3.9.0 Changes:
+  - Added system key protection (legacy keys cannot be deleted)
+  - System keys are hidden from list endpoints (invisible to garbage collector)
 """
 
 import subprocess
@@ -38,7 +42,7 @@ import re
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "3.8.0"
+__version__ = "3.9.0"
 
 app = Flask(__name__)
 
@@ -77,8 +81,35 @@ VPN_SERVICES = [
     "tuic-d2",
     "xray",
     "shadowsocks",
+    "wg-quick@wg0",
     "AdGuardHome",
 ]
+
+# =============================================================================
+# SYSTEM KEY PROTECTION
+# These keys are created during VPN installation and should NEVER be deleted.
+# They keep services running even when no real users exist.
+# =============================================================================
+
+# TUIC system keys (must be valid UUIDs)
+TUIC_SYSTEM_UUIDS = {
+    "00000000-0000-0000-0000-000000000000",  # legacy placeholder
+}
+
+# Hysteria2 system keys (usernames)
+HYSTERIA_SYSTEM_USERS = {
+    "legacy",  # legacy placeholder
+}
+
+
+def _is_tuic_system_key(uuid_str: str) -> bool:
+    """Check if TUIC UUID is a system key that should not be deleted."""
+    return uuid_str.lower() in TUIC_SYSTEM_UUIDS
+
+
+def _is_hysteria_system_key(username: str) -> bool:
+    """Check if Hysteria2 username is a system key that should not be deleted."""
+    return username.lower() in HYSTERIA_SYSTEM_USERS
 
 
 def require_token(f):
@@ -341,6 +372,14 @@ def delete_tuic_key(user_uuid: str):
     """Remove TUIC user. Supports domain_index query param for multi-domain setups."""
     domain_index = request.args.get("domain_index", 0, type=int)
     
+    # PROTECTION: Cannot delete system keys
+    if _is_tuic_system_key(user_uuid):
+        return jsonify({
+            "error": "Cannot delete system key",
+            "uuid": user_uuid,
+            "reason": "This is a protected system key required for service operation"
+        }), 403
+    
     # Validate domain_index
     if domain_index < 0 or domain_index >= len(TUIC_CONFIGS):
         return jsonify({"error": f"Invalid domain_index: {domain_index}"}), 400
@@ -378,7 +417,11 @@ def delete_tuic_key(user_uuid: str):
 @app.route("/keys/tuic", methods=["GET"])
 @require_token
 def list_tuic_keys():
-    """List all TUIC users. Supports domain_index query param."""
+    """List all TUIC users. Supports domain_index query param.
+    
+    NOTE: System keys are hidden from this list to prevent garbage collector
+    from seeing and attempting to delete them.
+    """
     domain_index = request.args.get("domain_index", 0, type=int)
     
     # Validate domain_index
@@ -391,11 +434,14 @@ def list_tuic_keys():
         config = read_json_config(config_path)
         users = config.get("users", {})
         
+        # Filter out system keys - they should be invisible to garbage collector
+        filtered_users = {k: v for k, v in users.items() if not _is_tuic_system_key(k)}
+        
         return jsonify({
             "protocol": "tuic",
             "domain_index": domain_index,
-            "count": len(users),
-            "users": users  # Return as dict {uuid: password}
+            "count": len(filtered_users),
+            "users": filtered_users  # Return as dict {uuid: password}
         })
         
     except FileNotFoundError:
@@ -744,6 +790,14 @@ def delete_hysteria2_key(username: str):
     """Remove Hysteria2 user. Supports domain_index query param for multi-domain setups."""
     domain_index = request.args.get("domain_index", 0, type=int)
     
+    # PROTECTION: Cannot delete system keys
+    if _is_hysteria_system_key(username):
+        return jsonify({
+            "error": "Cannot delete system key",
+            "username": username,
+            "reason": "This is a protected system key required for service operation"
+        }), 403
+    
     # Validate domain_index
     if domain_index < 0 or domain_index >= len(HYSTERIA_CONFIGS):
         return jsonify({"error": f"Invalid domain_index: {domain_index}"}), 400
@@ -786,7 +840,11 @@ def delete_hysteria2_key(username: str):
 @app.route("/keys/hysteria2", methods=["GET"])
 @require_token
 def list_hysteria2_keys():
-    """List all Hysteria2 users. Supports domain_index query param."""
+    """List all Hysteria2 users. Supports domain_index query param.
+    
+    NOTE: System keys are hidden from this list to prevent garbage collector
+    from seeing and attempting to delete them.
+    """
     domain_index = request.args.get("domain_index", 0, type=int)
     
     # Validate domain_index
@@ -801,22 +859,24 @@ def list_hysteria2_keys():
         auth = config.get("auth", {})
         
         if auth.get("type") == "password":
-            # Single password mode
+            # Single password mode - no users to list (legacy mode)
             return jsonify({
                 "protocol": "hysteria2",
                 "domain_index": domain_index,
                 "mode": "password",
-                "count": 1,
-                "users": {"default": auth.get("password", "")}
+                "count": 0,
+                "users": {}
             })
         elif auth.get("type") == "userpass":
             userpass = auth.get("userpass", {})
+            # Filter out system keys - they should be invisible to garbage collector
+            filtered_users = {k: v for k, v in userpass.items() if not _is_hysteria_system_key(k)}
             return jsonify({
                 "protocol": "hysteria2",
                 "domain_index": domain_index,
                 "mode": "userpass",
-                "count": len(userpass),
-                "users": userpass  # Return as dict {username: password}
+                "count": len(filtered_users),
+                "users": filtered_users  # Return as dict {username: password}
             })
         else:
             return jsonify({
