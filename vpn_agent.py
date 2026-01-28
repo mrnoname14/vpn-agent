@@ -81,7 +81,6 @@ VPN_SERVICES = [
     "tuic-d2",
     "xray",
     "shadowsocks",
-    "wg-quick@wg0",
     "AdGuardHome",
 ]
 
