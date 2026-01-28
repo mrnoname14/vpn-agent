@@ -38,7 +38,7 @@ import re
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "3.7.0"
+__version__ = "3.8.0"
 
 app = Flask(__name__)
 
@@ -77,7 +77,6 @@ VPN_SERVICES = [
     "tuic-d2",
     "xray",
     "shadowsocks",
-    "wg-quick@wg0",
     "AdGuardHome",
 ]
 
