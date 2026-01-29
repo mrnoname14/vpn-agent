@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v2.0.0
+VPN Key Agent v3.9.4
 Extended VPN Health Agent with key management for multi-user support.
 
 New Endpoints:
@@ -15,6 +15,7 @@ New Endpoints:
   POST   /keys/hysteria2      - Add Hysteria2 user
   DELETE /keys/hysteria2/{username} - Remove Hysteria2 user
   GET    /keys/{protocol}     - List all keys for protocol
+  POST   /restart-self        - Restart the agent itself
 
 Original Endpoints (from v1.3):
   GET  /              - basic info (no auth)
@@ -23,6 +24,13 @@ Original Endpoints (from v1.3):
   POST /restart/{svc} - restart a service
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
+
+v3.9.4 Changes:
+  - Added /restart-self endpoint for remote agent restart via API
+
+v3.9.3 Changes:
+  - Added system key protection (legacy keys cannot be deleted)
+  - System keys are hidden from list endpoints
 """
 
 import subprocess
@@ -38,7 +46,7 @@ import re
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "3.9.3"
+__version__ = "3.9.4"
 
 app = Flask(__name__)
 
@@ -946,6 +954,29 @@ def restart_all():
         "failed": [r["service"] for r in results if not r.get("success")],
         "details": results,
     })
+
+
+@app.route("/restart-self", methods=["POST"])
+@require_token
+def restart_self():
+    """
+    Restart the VPN Agent itself.
+    Uses systemd to restart, response sent before restart.
+    """
+    try:
+        # Start restart in background so we can respond first
+        subprocess.Popen(
+            ["bash", "-c", "sleep 1 && systemctl restart vpn-agent"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return jsonify({
+            "success": True,
+            "message": "Agent restart initiated",
+            "version": __version__,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/info", methods=["GET"])
