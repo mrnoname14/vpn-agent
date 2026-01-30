@@ -25,6 +25,11 @@ Original Endpoints (from v1.3):
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
 
+v3.9.5 Changes:
+  - Fixed Shadowsocks: changed config path from /etc/outline/config.yml to /etc/shadowsocks-rust/config.json
+  - Shadowsocks now uses JSON format and shadowsocks-rust multi-user mode (users array)
+  - Updated SS endpoints to use 'name'/'password' instead of 'id'/'secret'
+
 v3.9.4 Changes:
   - Added /restart-self endpoint for remote agent restart via API
 
@@ -46,7 +51,7 @@ import re
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "3.9.4"
+__version__ = "3.9.5"
 
 app = Flask(__name__)
 
@@ -56,7 +61,7 @@ API_TOKEN = os.environ.get("VPN_AGENT_TOKEN", "")
 XRAY_CONFIG = "/usr/local/etc/xray/config.json"
 TUIC_CONFIG = "/etc/tuic/config.json"
 TUIC_CONFIG_D2 = "/etc/tuic/config-d2.json"  # Second domain
-SS_CONFIG = "/etc/outline/config.yml"
+SS_CONFIG = "/etc/shadowsocks-rust/config.json"
 WG_CONFIG = "/etc/wireguard/wg0.conf"
 HYSTERIA_CONFIG = "/etc/hysteria/config.yaml"
 HYSTERIA_CONFIG_D2 = "/etc/hysteria/config-d2.yaml"  # Second domain
@@ -440,75 +445,69 @@ def list_tuic_keys():
 @app.route("/keys/shadowsocks", methods=["POST"])
 @require_token
 def add_shadowsocks_key():
-    """Add Shadowsocks key."""
+    """Add Shadowsocks user (shadowsocks-rust multi-user mode)."""
     data = request.get_json() or {}
-    key_id = data.get("id") or f"user{int(time.time())}"
-    port = data.get("port", 8388)
-    cipher = data.get("cipher", "chacha20-ietf-poly1305")
-    secret = data.get("secret") or secrets.token_urlsafe(32)
+    user_name = data.get("name") or data.get("id") or f"user{int(time.time())}"
+    password = data.get("password") or data.get("secret") or secrets.token_urlsafe(32)
     
     try:
-        config = read_yaml_config(SS_CONFIG)
+        config = read_json_config(SS_CONFIG)
         
-        keys = config.get("keys", [])
+        users = config.get("users", [])
         
-        # Check if ID exists
-        for key in keys:
-            if key.get("id") == key_id:
-                return jsonify({"error": "Key ID already exists", "id": key_id}), 409
+        # Check if name exists
+        for user in users:
+            if user.get("name") == user_name:
+                return jsonify({"error": "User already exists", "name": user_name}), 409
         
-        new_key = {
-            "id": key_id,
-            "port": port,
-            "cipher": cipher,
-            "secret": secret
+        new_user = {
+            "name": user_name,
+            "password": password
         }
-        keys.append(new_key)
-        config["keys"] = keys
+        users.append(new_user)
+        config["users"] = users
         
-        write_yaml_config(SS_CONFIG, config)
+        write_json_config(SS_CONFIG, config)
         
         restart_result = restart_service_sync("shadowsocks")
         
         return jsonify({
             "success": True,
-            "id": key_id,
-            "port": port,
-            "cipher": cipher,
-            "secret": secret,
+            "name": user_name,
+            "password": password,
             "restart": restart_result,
-            "total_keys": len(keys)
+            "total_users": len(users)
         })
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/keys/shadowsocks/<key_id>", methods=["DELETE"])
+@app.route("/keys/shadowsocks/<user_name>", methods=["DELETE"])
 @require_token
-def delete_shadowsocks_key(key_id: str):
-    """Remove Shadowsocks key."""
+def delete_shadowsocks_key(user_name: str):
+    """Remove Shadowsocks user."""
     try:
-        config = read_yaml_config(SS_CONFIG)
+        config = read_json_config(SS_CONFIG)
         
-        keys = config.get("keys", [])
-        original_count = len(keys)
+        users = config.get("users", [])
+        original_count = len(users)
         
-        keys = [k for k in keys if k.get("id") != key_id]
+        users = [u for u in users if u.get("name") != user_name]
         
-        if len(keys) == original_count:
-            return jsonify({"error": "Key ID not found"}), 404
+        if len(users) == original_count:
+            return jsonify({"error": "User not found"}), 404
         
-        config["keys"] = keys
-        write_yaml_config(SS_CONFIG, config)
+        config["users"] = users
+        write_json_config(SS_CONFIG, config)
         
         restart_result = restart_service_sync("shadowsocks")
         
         return jsonify({
             "success": True,
-            "deleted_id": key_id,
+            "deleted_name": user_name,
             "restart": restart_result,
-            "total_keys": len(keys)
+            "total_users": len(users)
         })
         
     except Exception as e:
@@ -518,17 +517,24 @@ def delete_shadowsocks_key(key_id: str):
 @app.route("/keys/shadowsocks", methods=["GET"])
 @require_token
 def list_shadowsocks_keys():
-    """List all Shadowsocks keys."""
+    """List all Shadowsocks users."""
     try:
-        config = read_yaml_config(SS_CONFIG)
-        keys = config.get("keys", [])
+        config = read_json_config(SS_CONFIG)
+        users = config.get("users", [])
         
         return jsonify({
             "protocol": "shadowsocks",
-            "count": len(keys),
-            "keys": keys
+            "count": len(users),
+            "users": users
         })
         
+    except FileNotFoundError:
+        return jsonify({
+            "protocol": "shadowsocks",
+            "count": 0,
+            "users": [],
+            "error": f"Config not found: {SS_CONFIG}"
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
