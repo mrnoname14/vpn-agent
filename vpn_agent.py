@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v3.9.4
+VPN Key Agent v3.9.6
 Extended VPN Health Agent with key management for multi-user support.
 
 New Endpoints:
@@ -16,6 +16,7 @@ New Endpoints:
   DELETE /keys/hysteria2/{username} - Remove Hysteria2 user
   GET    /keys/{protocol}     - List all keys for protocol
   POST   /restart-self        - Restart the agent itself
+  GET    /traffic             - Server network traffic stats
 
 Original Endpoints (from v1.3):
   GET  /              - basic info (no auth)
@@ -24,6 +25,9 @@ Original Endpoints (from v1.3):
   POST /restart/{svc} - restart a service
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
+
+v3.9.6 Changes:
+  - Added GET /traffic endpoint - returns server network traffic (bytes in/out from /proc/net/dev)
 
 v3.9.5 Changes:
   - Fixed Shadowsocks: changed config path from /etc/outline/config.yml to /etc/shadowsocks-rust/config.json
@@ -51,7 +55,7 @@ import re
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "3.9.5"
+__version__ = "3.9.6"
 
 app = Flask(__name__)
 
@@ -1015,6 +1019,73 @@ def server_info():
     except Exception as e:
         info["error"] = str(e)
     return jsonify(info)
+
+
+# ==================== Traffic Stats ====================
+
+def _get_main_interface():
+    """Find main network interface (eth0, ens3, etc). Skip lo and docker."""
+    try:
+        with open("/proc/net/dev") as f:
+            lines = f.readlines()[2:]  # Skip headers
+        for line in lines:
+            iface = line.split(":")[0].strip()
+            if iface in ("lo",) or iface.startswith(("docker", "br-", "veth")):
+                continue
+            return iface
+    except Exception:
+        pass
+    return "eth0"  # fallback
+
+
+def _parse_proc_net_dev(interface):
+    """Read bytes_in/bytes_out from /proc/net/dev for given interface."""
+    with open("/proc/net/dev") as f:
+        for line in f:
+            if interface + ":" in line:
+                parts = line.split(":")[1].split()
+                return int(parts[0]), int(parts[8])  # bytes_recv, bytes_sent
+    return None, None
+
+
+def _format_bytes(b):
+    """Format bytes to human readable."""
+    if b is None:
+        return "N/A"
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if abs(b) < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} PB"
+
+
+@app.route("/traffic", methods=["GET"])
+@require_token
+def traffic_stats():
+    """
+    Get server network traffic from /proc/net/dev.
+    Returns total bytes in/out since last server reboot.
+    Safe read-only operation - no config changes.
+    """
+    try:
+        interface = _get_main_interface()
+        bytes_in, bytes_out = _parse_proc_net_dev(interface)
+
+        if bytes_in is None:
+            return jsonify({"error": f"Interface {interface} not found"}), 404
+
+        return jsonify({
+            "interface": interface,
+            "bytes_in": bytes_in,
+            "bytes_out": bytes_out,
+            "bytes_in_human": _format_bytes(bytes_in),
+            "bytes_out_human": _format_bytes(bytes_out),
+            "bytes_total": bytes_in + bytes_out,
+            "bytes_total_human": _format_bytes(bytes_in + bytes_out),
+            "timestamp": int(time.time()),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
