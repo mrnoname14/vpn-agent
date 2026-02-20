@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v3.9.6
+VPN Key Agent v3.9.7
 Extended VPN Health Agent with key management for multi-user support.
 
 New Endpoints:
@@ -25,6 +25,10 @@ Original Endpoints (from v1.3):
   POST /restart/{svc} - restart a service
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
+
+v3.9.7 Changes:
+  - Added real cpu_percent to /info endpoint (from /proc/stat, auto-scales with any core count)
+  - Replaces broken load_avg * 100 calculation in backend
 
 v3.9.6 Changes:
   - Added GET /traffic endpoint - returns server network traffic (bytes in/out from /proc/net/dev)
@@ -55,7 +59,7 @@ import re
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "3.9.6"
+__version__ = "3.9.7"
 
 app = Flask(__name__)
 
@@ -989,11 +993,40 @@ def restart_self():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+def _read_cpu_times():
+    """Read total and idle CPU times from /proc/stat. Works with any number of cores."""
+    with open("/proc/stat") as f:
+        line = f.readline()  # First line = aggregated across all CPUs
+    parts = line.split()
+    # user, nice, system, idle, iowait, irq, softirq, steal
+    times = [int(x) for x in parts[1:9]]
+    idle = times[3] + times[4]  # idle + iowait
+    total = sum(times)
+    return total, idle
+
+
+def _get_cpu_percent(interval=0.5):
+    """Get real CPU usage % via two /proc/stat samples. Auto-scales with any core count."""
+    try:
+        t1, i1 = _read_cpu_times()
+        time.sleep(interval)
+        t2, i2 = _read_cpu_times()
+        total_diff = t2 - t1
+        idle_diff = i2 - i1
+        if total_diff == 0:
+            return 0.0
+        return round((1.0 - idle_diff / total_diff) * 100, 1)
+    except Exception:
+        return 0.0
+
+
 @app.route("/info", methods=["GET"])
 @require_token
 def server_info():
     info = {"version": __version__}
     try:
+        # Real CPU % (auto-scales with any number of cores)
+        info["cpu_percent"] = _get_cpu_percent()
         with open("/proc/uptime") as f:
             info["uptime_hours"] = round(float(f.read().split()[0]) / 3600, 1)
         with open("/proc/loadavg") as f:
