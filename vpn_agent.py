@@ -26,6 +26,13 @@ Original Endpoints (from v1.3):
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
 
+v3.9.9 Changes:
+  - SIGHUP hot reload for shadowsocks and hysteria2 (in addition to xray)
+  - hot_reload_service(service) — universal SIGHUP for all supported services
+  - /reload endpoint now uses SIGHUP for xray, shadowsocks, hysteria, hysteria-d2
+  - TUIC still uses systemctl restart (no SIGHUP support)
+  - Result: adding/removing keys causes ZERO connection drops for existing users
+
 v3.9.8 Changes:
   - Added no_restart flag to all /keys/* endpoints (POST body or GET query param)
   - Added POST /reload endpoint for batch reload after multiple key operations
@@ -65,7 +72,7 @@ import re
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "3.9.8"
+__version__ = "3.9.9"
 
 app = Flask(__name__)
 
@@ -164,30 +171,57 @@ def restart_service_sync(service: str, timeout: int = 30) -> dict:
         return {"success": False, "error": str(e)}
 
 
-def hot_reload_xray() -> dict:
+# Services that support SIGHUP hot reload (no connection drops)
+SIGHUP_SUPPORTED = {
+    "xray",
+    "shadowsocks",
+    "hysteria",
+    "hysteria-d2",
+}
+
+# Systemd service name → process name for pkill
+SERVICE_PROCESS_MAP = {
+    "xray": "xray",
+    "shadowsocks": "ssserver",
+    "hysteria": "hysteria",
+    "hysteria-d2": "hysteria",
+}
+
+
+def hot_reload_service(service: str) -> dict:
     """
-    Hot reload xray config via SIGHUP — no connection drops.
+    Hot reload a service via SIGHUP — no connection drops, no restart.
     Existing tunnels stay alive, new config applied instantly.
-    Falls back to full restart if SIGHUP fails.
+    Falls back to full restart only if SIGHUP fails.
+    Supported: xray, shadowsocks, hysteria, hysteria-d2.
     """
+    process_name = SERVICE_PROCESS_MAP.get(service)
+    if not process_name:
+        # Not in map — use full restart
+        return restart_service_sync(service)
+    
     try:
         result = subprocess.run(
-            ["pkill", "-HUP", "-x", "xray"],
+            ["pkill", "-HUP", "-x", process_name],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
             time.sleep(0.3)
-            # Verify still active
             check = subprocess.run(
-                ["systemctl", "is-active", "xray"],
+                ["systemctl", "is-active", service],
                 capture_output=True, text=True, timeout=5
             )
             if check.stdout.strip() == "active":
                 return {"success": True, "method": "sighup"}
         # SIGHUP failed — fall back to full restart
-        return restart_service_sync("xray")
+        return restart_service_sync(service)
     except Exception as e:
-        return restart_service_sync("xray")
+        return restart_service_sync(service)
+
+
+def hot_reload_xray() -> dict:
+    """Hot reload xray (backward compat)."""
+    return hot_reload_service("xray")
 
 
 def read_json_config(path: str) -> dict:
@@ -1036,8 +1070,8 @@ def reload_services():
     
     results = {}
     for service in services:
-        if service == "xray":
-            results[service] = hot_reload_xray()
+        if service in SIGHUP_SUPPORTED:
+            results[service] = hot_reload_service(service)
         else:
             results[service] = restart_service_sync(service)
     
