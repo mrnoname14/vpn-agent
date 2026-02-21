@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v3.9.8
+VPN Key Agent v4.0.0
 Extended VPN Health Agent with key management for multi-user support.
 
 New Endpoints:
@@ -25,6 +25,12 @@ Original Endpoints (from v1.3):
   POST /restart/{svc} - restart a service
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
+
+v4.0.0 Changes:
+  - TUIC debounce restart: config changes are batched, restart fires 30s after last change
+  - Result: 200 key ops/day = 1-2 TUIC restarts instead of 200
+  - New users get TUIC within 30s max; existing users lose connection only on restart
+  - /reload endpoint: tuic/tuic-d2 now use debounce instead of immediate restart
 
 v3.9.9 Changes:
   - SIGHUP hot reload for shadowsocks and hysteria2 (in addition to xray)
@@ -69,10 +75,11 @@ import uuid
 import base64
 import secrets
 import re
+import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "3.9.9"
+__version__ = "4.0.0"
 
 app = Flask(__name__)
 
@@ -113,6 +120,50 @@ VPN_SERVICES = [
     "shadowsocks",
     "AdGuardHome",
 ]
+
+# ==================== TUIC DEBOUNCE RESTART ====================
+# TUIC does not support SIGHUP, so we batch config changes and
+# restart once after 30s of inactivity instead of on every key op.
+# This means 200 migrations/day = 1-2 restarts instead of 200.
+
+TUIC_DEBOUNCE_DELAY = 30  # seconds
+
+# {service_name: threading.Timer}
+_tuic_timers: dict = {}
+_tuic_timers_lock = threading.Lock()
+
+
+def _do_tuic_restart(service: str):
+    """Actually restart TUIC. Called by debounce timer."""
+    with _tuic_timers_lock:
+        _tuic_timers.pop(service, None)
+    app.logger.warning(f"[TUIC-DEBOUNCE] Restarting {service} after debounce delay")
+    result = restart_service_sync(service)
+    app.logger.warning(f"[TUIC-DEBOUNCE] {service} restart result: {result}")
+
+
+def schedule_tuic_restart(service: str):
+    """
+    Schedule a debounced restart for a TUIC service.
+    If called multiple times within TUIC_DEBOUNCE_DELAY seconds,
+    only ONE restart fires — 30s after the LAST call.
+    """
+    with _tuic_timers_lock:
+        # Cancel existing timer if pending
+        existing = _tuic_timers.get(service)
+        if existing:
+            existing.cancel()
+            app.logger.info(f"[TUIC-DEBOUNCE] Reset timer for {service}")
+
+        # Schedule new restart
+        timer = threading.Timer(TUIC_DEBOUNCE_DELAY, _do_tuic_restart, args=[service])
+        timer.daemon = True
+        timer.start()
+        _tuic_timers[service] = timer
+        app.logger.info(f"[TUIC-DEBOUNCE] Scheduled restart for {service} in {TUIC_DEBOUNCE_DELAY}s")
+
+
+# ==================== END TUIC DEBOUNCE ====================
 
 # System key protection
 TUIC_SYSTEM_UUIDS = {"00000000-0000-0000-0000-000000000000"}
@@ -420,7 +471,11 @@ def add_tuic_key():
         write_json_config(config_path, config)
         
         no_restart = data.get("no_restart", False)
-        restart_result = {"success": True, "method": "skipped"} if no_restart else restart_service_sync(service_name)
+        if no_restart:
+            restart_result = {"success": True, "method": "skipped"}
+        else:
+            schedule_tuic_restart(service_name)
+            restart_result = {"success": True, "method": "debounced", "delay_seconds": TUIC_DEBOUNCE_DELAY}
         
         return jsonify({
             "success": True,
@@ -466,7 +521,11 @@ def delete_tuic_key(user_uuid: str):
         write_json_config(config_path, config)
         
         no_restart = request.args.get("no_restart", "false").lower() == "true"
-        restart_result = {"success": True, "method": "skipped"} if no_restart else restart_service_sync(service_name)
+        if no_restart:
+            restart_result = {"success": True, "method": "skipped"}
+        else:
+            schedule_tuic_restart(service_name)
+            restart_result = {"success": True, "method": "debounced", "delay_seconds": TUIC_DEBOUNCE_DELAY}
         
         return jsonify({
             "success": True,
@@ -1072,6 +1131,10 @@ def reload_services():
     for service in services:
         if service in SIGHUP_SUPPORTED:
             results[service] = hot_reload_service(service)
+        elif service in ("tuic", "tuic-d2"):
+            # Debounced restart — batches multiple /reload calls
+            schedule_tuic_restart(service)
+            results[service] = {"success": True, "method": "debounced", "delay_seconds": TUIC_DEBOUNCE_DELAY}
         else:
             results[service] = restart_service_sync(service)
     
