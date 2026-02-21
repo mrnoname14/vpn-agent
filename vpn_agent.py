@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v3.9.7
+VPN Key Agent v3.9.8
 Extended VPN Health Agent with key management for multi-user support.
 
 New Endpoints:
@@ -25,6 +25,12 @@ Original Endpoints (from v1.3):
   POST /restart/{svc} - restart a service
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
+
+v3.9.8 Changes:
+  - Added no_restart flag to all /keys/* endpoints (POST body or GET query param)
+  - Added POST /reload endpoint for batch reload after multiple key operations
+  - hot_reload_xray() uses SIGHUP instead of systemctl restart (no connection drops)
+  - Fixes 10-min VPN outage caused by parallel key ops each triggering full restart
 
 v3.9.7 Changes:
   - Added real cpu_percent to /info endpoint (from /proc/stat, auto-scales with any core count)
@@ -59,7 +65,7 @@ import re
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "3.9.7"
+__version__ = "3.9.8"
 
 app = Flask(__name__)
 
@@ -158,6 +164,32 @@ def restart_service_sync(service: str, timeout: int = 30) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def hot_reload_xray() -> dict:
+    """
+    Hot reload xray config via SIGHUP — no connection drops.
+    Existing tunnels stay alive, new config applied instantly.
+    Falls back to full restart if SIGHUP fails.
+    """
+    try:
+        result = subprocess.run(
+            ["pkill", "-HUP", "-x", "xray"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            time.sleep(0.3)
+            # Verify still active
+            check = subprocess.run(
+                ["systemctl", "is-active", "xray"],
+                capture_output=True, text=True, timeout=5
+            )
+            if check.stdout.strip() == "active":
+                return {"success": True, "method": "sighup"}
+        # SIGHUP failed — fall back to full restart
+        return restart_service_sync("xray")
+    except Exception as e:
+        return restart_service_sync("xray")
+
+
 def read_json_config(path: str) -> dict:
     """Read JSON config file."""
     with open(path, 'r') as f:
@@ -238,8 +270,9 @@ def add_vless_key():
         
         write_json_config(XRAY_CONFIG, config)
         
-        # Restart xray
-        restart_result = restart_service_sync("xray")
+        # Reload xray (SIGHUP = hot reload, no connection drops)
+        no_restart = data.get("no_restart", False)
+        restart_result = {"success": True, "method": "skipped"} if no_restart else hot_reload_xray()
         
         return jsonify({
             "success": True,
@@ -281,7 +314,8 @@ def delete_vless_key(client_uuid: str):
         vless_inbound["settings"]["clients"] = clients
         write_json_config(XRAY_CONFIG, config)
         
-        restart_result = restart_service_sync("xray")
+        no_restart = request.args.get("no_restart", "false").lower() == "true"
+        restart_result = {"success": True, "method": "skipped"} if no_restart else hot_reload_xray()
         
         return jsonify({
             "success": True,
@@ -351,7 +385,8 @@ def add_tuic_key():
         
         write_json_config(config_path, config)
         
-        restart_result = restart_service_sync(service_name)
+        no_restart = data.get("no_restart", False)
+        restart_result = {"success": True, "method": "skipped"} if no_restart else restart_service_sync(service_name)
         
         return jsonify({
             "success": True,
@@ -396,7 +431,8 @@ def delete_tuic_key(user_uuid: str):
         
         write_json_config(config_path, config)
         
-        restart_result = restart_service_sync(service_name)
+        no_restart = request.args.get("no_restart", "false").lower() == "true"
+        restart_result = {"success": True, "method": "skipped"} if no_restart else restart_service_sync(service_name)
         
         return jsonify({
             "success": True,
@@ -477,7 +513,8 @@ def add_shadowsocks_key():
         
         write_json_config(SS_CONFIG, config)
         
-        restart_result = restart_service_sync("shadowsocks")
+        no_restart = data.get("no_restart", False)
+        restart_result = {"success": True, "method": "skipped"} if no_restart else restart_service_sync("shadowsocks")
         
         return jsonify({
             "success": True,
@@ -509,7 +546,8 @@ def delete_shadowsocks_key(user_name: str):
         config["users"] = users
         write_json_config(SS_CONFIG, config)
         
-        restart_result = restart_service_sync("shadowsocks")
+        no_restart = request.args.get("no_restart", "false").lower() == "true"
+        restart_result = {"success": True, "method": "skipped"} if no_restart else restart_service_sync("shadowsocks")
         
         return jsonify({
             "success": True,
@@ -761,7 +799,8 @@ def add_hysteria2_key():
         
         write_yaml_config(config_path, config)
         
-        restart_result = restart_service_sync(service_name)
+        no_restart = data.get("no_restart", False)
+        restart_result = {"success": True, "method": "skipped"} if no_restart else restart_service_sync(service_name)
         
         userpass = config["auth"].get("userpass", {})
         
@@ -813,7 +852,8 @@ def delete_hysteria2_key(username: str):
         
         write_yaml_config(config_path, config)
         
-        restart_result = restart_service_sync(service_name)
+        no_restart = request.args.get("no_restart", "false").lower() == "true"
+        restart_result = {"success": True, "method": "skipped"} if no_restart else restart_service_sync(service_name)
         
         return jsonify({
             "success": True,
@@ -968,6 +1008,44 @@ def restart_all():
         "failed": [r["service"] for r in results if not r.get("success")],
         "details": results,
     })
+
+
+@app.route("/reload", methods=["POST"])
+@require_token
+def reload_services():
+    """
+    Reload/restart specified services after batch key operations.
+    Call this ONCE after all key add/delete operations instead of
+    restarting after each individual key change.
+    
+    Body: {"services": ["xray", "shadowsocks", "tuic", "tuic-d2", "hysteria", "hysteria-d2"]}
+    Xray uses SIGHUP (hot reload, no connection drops).
+    Other services use systemctl restart.
+    """
+    data = request.get_json() or {}
+    services = data.get("services", [])
+    
+    if not services:
+        return jsonify({"error": "No services specified"}), 400
+    
+    # Validate all services
+    allowed = set(VPN_SERVICES)
+    invalid = [s for s in services if s not in allowed]
+    if invalid:
+        return jsonify({"error": f"Unknown services: {invalid}"}), 400
+    
+    results = {}
+    for service in services:
+        if service == "xray":
+            results[service] = hot_reload_xray()
+        else:
+            results[service] = restart_service_sync(service)
+    
+    all_ok = all(r.get("success") for r in results.values())
+    return jsonify({
+        "success": all_ok,
+        "results": results,
+    }), 200 if all_ok else 500
 
 
 @app.route("/restart-self", methods=["POST"])
