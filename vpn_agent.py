@@ -26,6 +26,10 @@ Original Endpoints (from v1.3):
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
 
+v4.1.1 Changes:
+  - Hysteria2 debounce delay increased: 30s → 120s (2 min) to reduce restart frequency
+  - Expected result: ~15 restarts/day → 3-5 restarts/day
+
 v4.1.0 Changes:
   - Hysteria2 debounce restart: same as TUIC — config written immediately, ONE restart after 30s
   - REMOVED hysteria/hysteria-d2 from SIGHUP_SUPPORTED (SIGHUP kills Hysteria2 process!)
@@ -85,7 +89,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.1.0"
+__version__ = "4.1.1"
 
 app = Flask(__name__)
 
@@ -177,7 +181,7 @@ def schedule_tuic_restart(service: str):
 # Same debounce approach as TUIC: write config immediately, restart
 # once after 30s of inactivity. 43 restarts/day → 2-5 restarts/day.
 
-HYSTERIA_DEBOUNCE_DELAY = 30  # seconds
+HYSTERIA_DEBOUNCE_DELAY = 120  # seconds (2 min)
 
 _hysteria_timers: dict = {}
 _hysteria_timers_lock = threading.Lock()
