@@ -17,6 +17,7 @@ New Endpoints:
   GET    /keys/{protocol}     - List all keys for protocol
   POST   /restart-self        - Restart the agent itself
   GET    /traffic             - Server network traffic stats
+  GET    /check-ipv4          - Check IPv4/IPv6 configuration
 
 Original Endpoints (from v1.3):
   GET  /              - basic info (no auth)
@@ -25,6 +26,10 @@ Original Endpoints (from v1.3):
   POST /restart/{svc} - restart a service
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
+
+v4.1.2 Changes:
+  - Added GET /check-ipv4 endpoint: checks gai.conf, sysctl IPv6, and IPv4 connectivity
+  - Used by health monitoring to detect IPv6 misconfigurations that break Hysteria2/TUIC
 
 v4.1.1 Changes:
   - Hysteria2 debounce delay increased: 30s → 120s (2 min) to reduce restart frequency
@@ -89,7 +94,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.1.1"
+__version__ = "4.1.2"
 
 app = Flask(__name__)
 
@@ -1073,6 +1078,62 @@ def list_hysteria2_keys():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ==================== IPv4 Configuration Check ====================
+
+@app.route("/check-ipv4", methods=["GET"])
+@require_token
+def check_ipv4_config():
+    """
+    Check IPv4/IPv6 configuration on this server.
+    Detects misconfigurations that cause Hysteria2/TUIC to fail
+    (Go ignores gai.conf/sysctl, needs GODEBUG=netdns=cgo).
+    """
+    result = {
+        "ipv4_priority": False,
+        "ipv6_disabled": False,
+        "ipv4_works": False,
+    }
+
+    # Check 1: gai.conf has IPv4 priority
+    try:
+        with open("/etc/gai.conf", "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("precedence") and "::ffff:0:0/96" in line:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        val = int(parts[2])
+                        if val >= 100:
+                            result["ipv4_priority"] = True
+                    break
+    except Exception as e:
+        result["gai_error"] = str(e)
+
+    # Check 2: IPv6 disabled via sysctl
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "net.ipv6.conf.all.disable_ipv6"],
+            capture_output=True, text=True, timeout=5
+        )
+        result["ipv6_disabled"] = out.stdout.strip() == "1"
+    except Exception as e:
+        result["sysctl_error"] = str(e)
+
+    # Check 3: IPv4 connectivity (quick test)
+    try:
+        out = subprocess.run(
+            ["curl", "-4", "-s", "--max-time", "5", "-o", "/dev/null", "-w", "%{http_code}", "https://www.google.com"],
+            capture_output=True, text=True, timeout=10
+        )
+        http_code = out.stdout.strip()
+        result["ipv4_works"] = http_code in ("200", "301", "302")
+        result["ipv4_http_code"] = http_code
+    except Exception as e:
+        result["ipv4_error"] = str(e)
+
+    return jsonify(result)
 
 
 # ==================== Original Health Endpoints ====================
