@@ -27,6 +27,11 @@ Original Endpoints (from v1.3):
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
 
+v4.1.3 Changes:
+  - CPU metrics: rolling 60-second average instead of 0.5s instant sample
+  - Background thread samples /proc/stat every 5s, /info returns smooth average
+  - Fixes spiky CPU readings in admin panel (7% → 70% → 7%)
+
 v4.1.2 Changes:
   - Added GET /check-ipv4 endpoint: checks gai.conf, sysctl IPv6, and IPv4 connectivity
   - Used by health monitoring to detect IPv6 misconfigurations that break Hysteria2/TUIC
@@ -94,7 +99,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.1.2"
+__version__ = "4.1.3"
 
 app = Flask(__name__)
 
@@ -1291,6 +1296,16 @@ def restart_self():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+# ==================== CPU Monitoring (rolling average) ====================
+# Background thread samples CPU every 5 seconds, keeps 60-second rolling average.
+# This prevents spiky readings from 0.5s instant samples (7% → 70% → 7%).
+
+_cpu_samples = []  # List of (timestamp, cpu_percent) tuples
+_cpu_samples_lock = threading.Lock()
+CPU_SAMPLE_INTERVAL = 5    # seconds between samples
+CPU_WINDOW_SECONDS = 60    # rolling average window
+
+
 def _read_cpu_times():
     """Read total and idle CPU times from /proc/stat. Works with any number of cores."""
     with open("/proc/stat") as f:
@@ -1303,8 +1318,42 @@ def _read_cpu_times():
     return total, idle
 
 
+def _cpu_sampler_thread():
+    """Background thread: samples CPU every 5s, stores in rolling buffer."""
+    prev_total, prev_idle = _read_cpu_times()
+    while True:
+        time.sleep(CPU_SAMPLE_INTERVAL)
+        try:
+            cur_total, cur_idle = _read_cpu_times()
+            total_diff = cur_total - prev_total
+            idle_diff = cur_idle - prev_idle
+            prev_total, prev_idle = cur_total, cur_idle
+            
+            if total_diff == 0:
+                cpu_pct = 0.0
+            else:
+                cpu_pct = round((1.0 - idle_diff / total_diff) * 100, 1)
+            
+            now = time.time()
+            with _cpu_samples_lock:
+                _cpu_samples.append((now, cpu_pct))
+                # Remove samples older than window
+                cutoff = now - CPU_WINDOW_SECONDS
+                while _cpu_samples and _cpu_samples[0][0] < cutoff:
+                    _cpu_samples.pop(0)
+        except Exception:
+            pass
+
+
 def _get_cpu_percent(interval=0.5):
-    """Get real CPU usage % via two /proc/stat samples. Auto-scales with any core count."""
+    """Get CPU usage % as rolling average over last 60 seconds.
+    Falls back to instant sample if no data yet (first 5 seconds after start)."""
+    with _cpu_samples_lock:
+        if _cpu_samples:
+            avg = sum(s[1] for s in _cpu_samples) / len(_cpu_samples)
+            return round(avg, 1)
+    
+    # Fallback: instant sample (only on first call before thread populates data)
     try:
         t1, i1 = _read_cpu_times()
         time.sleep(interval)
@@ -1316,6 +1365,11 @@ def _get_cpu_percent(interval=0.5):
         return round((1.0 - idle_diff / total_diff) * 100, 1)
     except Exception:
         return 0.0
+
+
+# Start CPU sampler thread
+_cpu_thread = threading.Thread(target=_cpu_sampler_thread, daemon=True)
+_cpu_thread.start()
 
 
 @app.route("/info", methods=["GET"])
