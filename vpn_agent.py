@@ -27,6 +27,11 @@ Original Endpoints (from v1.3):
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
 
+v4.2.0 Changes:
+  - SS 2022 support: user passwords now generated as base64(16 bytes) for AEAD-2022 ciphers
+  - Required for 2022-blake3-aes-128-gcm multi-user mode (EIH)
+  - No change to API interface — same name/password fields
+
 v4.1.3 Changes:
   - CPU metrics: rolling 60-second average instead of 0.5s instant sample
   - Background thread samples /proc/stat every 5s, /info returns smooth average
@@ -99,7 +104,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.1.3"
+__version__ = "4.2.0"
 
 app = Flask(__name__)
 
@@ -645,7 +650,8 @@ def add_shadowsocks_key():
     """Add Shadowsocks user (shadowsocks-rust multi-user mode)."""
     data = request.get_json() or {}
     user_name = data.get("name") or data.get("id") or f"user{int(time.time())}"
-    password = data.get("password") or data.get("secret") or secrets.token_urlsafe(32)
+    # SS 2022 requires base64-encoded 16-byte PSK (not urlsafe!)
+    password = data.get("password") or data.get("secret") or base64.b64encode(secrets.token_bytes(16)).decode()
     
     try:
         config = read_json_config(SS_CONFIG)
