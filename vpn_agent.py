@@ -27,6 +27,10 @@ Original Endpoints (from v1.3):
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
 
+v4.2.1 Changes:
+  - Removed shadowsocks from VPN_SERVICES health check (service stopped intentionally, DPI risk)
+  - SS keys/config endpoints still work — only monitoring disabled
+
 v4.2.0 Changes:
   - SS 2022 support: user passwords now generated as base64(16 bytes) for AEAD-2022 ciphers
   - Required for 2022-blake3-aes-128-gcm multi-user mode (EIH)
@@ -104,7 +108,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.2.0"
+__version__ = "4.2.1"
 
 app = Flask(__name__)
 
@@ -142,7 +146,7 @@ VPN_SERVICES = [
     "tuic",
     "tuic-d2",
     "xray",
-    "shadowsocks",
+    # "shadowsocks",  # Disabled: SS stopped intentionally (DPI risk 6/10)
     "AdGuardHome",
 ]
 
