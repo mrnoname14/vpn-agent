@@ -27,6 +27,11 @@ Original Endpoints (from v1.3):
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
 
+v4.2.2 Changes:
+  - IPv4 check: replaced curl https://google.com with ping -4 1.1.1.1
+  - Fixes false IPv4 alerts caused by AdGuard DoH cold-start DNS latency
+  - ping tests raw IPv4 connectivity without DNS dependency (5ms vs 3-5sec)
+
 v4.2.1 Changes:
   - Removed shadowsocks from VPN_SERVICES health check (service stopped intentionally, DPI risk)
   - SS keys/config endpoints still work — only monitoring disabled
@@ -108,7 +113,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.2.1"
+__version__ = "4.2.2"
 
 app = Flask(__name__)
 
@@ -1136,15 +1141,22 @@ def check_ipv4_config():
     except Exception as e:
         result["sysctl_error"] = str(e)
 
-    # Check 3: IPv4 connectivity (quick test)
+    # Check 3: IPv4 connectivity (ping — no DNS dependency)
+    # Previous method (curl https://google.com) caused false alerts because
+    # AdGuard DoH upstream needs TLS handshake after idle (~3sec), and
+    # curl 5sec timeout wasn't always enough (DNS + TLS + HTTP).
+    # Ping by IP tests raw IPv4 connectivity reliably in <100ms.
     try:
         out = subprocess.run(
-            ["curl", "-4", "-s", "--max-time", "5", "-o", "/dev/null", "-w", "%{http_code}", "https://www.google.com"],
-            capture_output=True, text=True, timeout=10
+            ["ping", "-4", "-c", "1", "-W", "3", "1.1.1.1"],
+            capture_output=True, text=True, timeout=5
         )
-        http_code = out.stdout.strip()
-        result["ipv4_works"] = http_code in ("200", "301", "302")
-        result["ipv4_http_code"] = http_code
+        result["ipv4_works"] = out.returncode == 0
+        # Extract ping time if available
+        if out.returncode == 0 and "time=" in out.stdout:
+            match = re.search(r"time=([\d.]+)", out.stdout)
+            if match:
+                result["ipv4_ping_ms"] = float(match.group(1))
     except Exception as e:
         result["ipv4_error"] = str(e)
 
