@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v4.1.0
+VPN Key Agent v4.2.3
 Extended VPN Health Agent with key management for multi-user support.
 
 New Endpoints:
@@ -26,6 +26,10 @@ Original Endpoints (from v1.3):
   POST /restart/{svc} - restart a service
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
+
+v4.2.3 Changes:
+  - Removed AdGuardHome from VPN_SERVICES health check (AdGuard removed from all servers)
+  - Phase 2.97: AdGuard caused 3-7s delays on YouTube/Instagram, DNS now direct
 
 v4.2.2 Changes:
   - IPv4 check: replaced curl https://google.com with ping -4 1.1.1.1
@@ -113,7 +117,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.2.2"
+__version__ = "4.2.3"
 
 app = Flask(__name__)
 
@@ -152,7 +156,7 @@ VPN_SERVICES = [
     "tuic-d2",
     "xray",
     # "shadowsocks",  # Disabled: SS stopped intentionally (DPI risk 6/10)
-    "AdGuardHome",
+    # "AdGuardHome",  # Removed Phase 2.97: caused 3-7s delays on YouTube/Instagram
 ]
 
 # ==================== TUIC DEBOUNCE RESTART ====================
