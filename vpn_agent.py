@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v4.2.3
+VPN Key Agent v4.3.0
 Extended VPN Health Agent with key management for multi-user support.
 
 New Endpoints:
@@ -49,6 +49,14 @@ v4.1.3 Changes:
   - CPU metrics: rolling 60-second average instead of 0.5s instant sample
   - Background thread samples /proc/stat every 5s, /info returns smooth average
   - Fixes spiky CPU readings in admin panel (7% → 70% → 7%)
+
+v4.3.0 Changes:
+  - CRITICAL FIX: Xray does NOT support SIGHUP — it kills the process silently!
+  - SIGHUP was sending kill signal to xray since v3.9.8, causing 3-5 min VLESS outages
+  - With Restart=on-failure in systemd, xray stayed dead until next key operation
+  - FIX: Removed xray (and shadowsocks) from SIGHUP_SUPPORTED → uses systemctl restart
+  - FIX: install.sh now sets Restart=always for xray systemd service
+  - Result: VLESS restarts cleanly in 2-3 sec instead of dying for 3-5 minutes
 
 v4.1.2 Changes:
   - Added GET /check-ipv4 endpoint: checks gai.conf, sysctl IPv6, and IPv4 connectivity
@@ -117,7 +125,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.2.3"
+__version__ = "4.3.0"
 
 app = Flask(__name__)
 
@@ -303,10 +311,8 @@ def restart_service_sync(service: str, timeout: int = 30) -> dict:
 
 
 # Services that support SIGHUP hot reload (no connection drops)
-SIGHUP_SUPPORTED = {
-    "xray",
-    "shadowsocks",
-}
+# v4.3.0: EMPTIED — xray dies on SIGHUP (verified 2026-04-07), shadowsocks removed from stack
+SIGHUP_SUPPORTED = set()
 
 # Systemd service name → process name for pkill
 SERVICE_PROCESS_MAP = {

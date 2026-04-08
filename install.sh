@@ -41,12 +41,20 @@ Type=simple
 ExecStart=/usr/bin/python3 /opt/vpn_agent.py
 Environment="VPN_AGENT_TOKEN=$TOKEN"
 Environment="VPN_AGENT_UPDATE_URL=$AGENT_URL"
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
+
+# Fix xray systemd: Restart=always (SIGHUP kills xray, needs auto-recovery)
+if [ -f /etc/systemd/system/xray.service ]; then
+    if grep -q 'Restart=on-failure' /etc/systemd/system/xray.service; then
+        sed -i 's/Restart=on-failure/Restart=always/' /etc/systemd/system/xray.service
+        echo "Fixed xray.service: Restart=always"
+    fi
+fi
 
 # Start service
 systemctl daemon-reload
