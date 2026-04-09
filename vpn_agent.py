@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v4.3.0
+VPN Key Agent v4.4.0
 Extended VPN Health Agent with key management for multi-user support.
 
 New Endpoints:
@@ -26,6 +26,16 @@ Original Endpoints (from v1.3):
   POST /restart/{svc} - restart a service
   POST /restart-all   - restart all stopped services
   GET  /info          - server info (uptime, load, memory, disk)
+
+
+v4.4.0 Changes:
+  - Xray gRPC API for zero-downtime user management (no more systemctl restart for VLESS!)
+  - add_vless_key() uses xray api adu (add user to inbound via gRPC) - 0 sec downtime
+  - delete_vless_key() uses xray api rmu (remove user from inbound via gRPC) - 0 sec downtime
+  - /reload endpoint: xray handled via grpc-api-noop (keys already added/removed inline)
+  - Config file still updated as backup (survives xray restart/reboot)
+  - Fallback: if gRPC API fails, falls back to systemctl restart
+  - Requires: api section + tag "vless-in" in xray config.json + port 10085 on localhost
 
 v4.2.3 Changes:
   - Removed AdGuardHome from VPN_SERVICES health check (AdGuard removed from all servers)
@@ -125,7 +135,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.3.0"
+__version__ = "4.4.0"
 
 app = Flask(__name__)
 
@@ -133,6 +143,11 @@ API_TOKEN = os.environ.get("VPN_AGENT_TOKEN", "")
 
 # Config paths
 XRAY_CONFIG = "/usr/local/etc/xray/config.json"
+
+# Xray gRPC API address (localhost only, configured in xray config.json api section)
+XRAY_GRPC_ADDR = "127.0.0.1:10085"
+XRAY_INBOUND_TAG = "vless-in"
+
 TUIC_CONFIG = "/etc/tuic/config.json"
 TUIC_CONFIG_D2 = "/etc/tuic/config-d2.json"  # Second domain
 SS_CONFIG = "/etc/shadowsocks-rust/config.json"
@@ -399,6 +414,63 @@ def write_yaml_config(path: str, data: dict):
         yaml.dump(data, f, default_flow_style=False)
 
 
+
+def xray_api_add_user(client_uuid: str, flow: str = "xtls-rprx-vision") -> dict:
+    """Add VLESS user via xray gRPC API - zero downtime, no restart."""
+    email = f"{client_uuid}@vless"
+    add_json = json.dumps({
+        "inbounds": [{
+            "tag": XRAY_INBOUND_TAG,
+            "protocol": "vless",
+            "port": 1,
+            "settings": {
+                "clients": [{"id": client_uuid, "email": email, "flow": flow, "level": 0}],
+                "decryption": "none"
+            }
+        }]
+    })
+    try:
+        tmp_path = f"/tmp/xray_adu_{client_uuid[:8]}.json"
+        with open(tmp_path, "w") as f:
+            f.write(add_json)
+        result = subprocess.run(
+            ["xray", "api", "adu", "-s", XRAY_GRPC_ADDR, tmp_path],
+            capture_output=True, text=True, timeout=5
+        )
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        if "result: ok" in result.stdout.lower() or "added 1" in result.stdout.lower():
+            app.logger.info(f"[XRAY-GRPC] Added user {client_uuid[:8]}... via gRPC API")
+            return {"success": True, "method": "grpc-api"}
+        else:
+            app.logger.warning(f"[XRAY-GRPC] adu failed: {result.stdout.strip()} {result.stderr.strip()}")
+            return restart_service_sync("xray")
+    except Exception as e:
+        app.logger.error(f"[XRAY-GRPC] adu exception: {e}, falling back to restart")
+        return restart_service_sync("xray")
+
+
+def xray_api_remove_user(client_uuid: str) -> dict:
+    """Remove VLESS user via xray gRPC API - zero downtime, no restart."""
+    email = f"{client_uuid}@vless"
+    try:
+        result = subprocess.run(
+            ["xray", "api", "rmu", "-s", XRAY_GRPC_ADDR, "-tag", XRAY_INBOUND_TAG, email],
+            capture_output=True, text=True, timeout=5
+        )
+        if "removed 1" in result.stdout.lower():
+            app.logger.info(f"[XRAY-GRPC] Removed user {client_uuid[:8]}... via gRPC API")
+            return {"success": True, "method": "grpc-api"}
+        else:
+            app.logger.warning(f"[XRAY-GRPC] rmu failed: {result.stdout.strip()} {result.stderr.strip()}")
+            return restart_service_sync("xray")
+    except Exception as e:
+        app.logger.error(f"[XRAY-GRPC] rmu exception: {e}, falling back to restart")
+        return restart_service_sync("xray")
+
+
 # ==================== VLESS (xray) ====================
 
 @app.route("/keys/vless", methods=["POST"])
@@ -439,9 +511,9 @@ def add_vless_key():
         
         write_json_config(XRAY_CONFIG, config)
         
-        # Reload xray (SIGHUP = hot reload, no connection drops)
+        # Add user via gRPC API (zero downtime) or skip if no_restart
         no_restart = data.get("no_restart", False)
-        restart_result = {"success": True, "method": "skipped"} if no_restart else hot_reload_xray()
+        restart_result = {"success": True, "method": "skipped"} if no_restart else xray_api_add_user(client_uuid, flow)
         
         return jsonify({
             "success": True,
@@ -484,7 +556,7 @@ def delete_vless_key(client_uuid: str):
         write_json_config(XRAY_CONFIG, config)
         
         no_restart = request.args.get("no_restart", "false").lower() == "true"
-        restart_result = {"success": True, "method": "skipped"} if no_restart else hot_reload_xray()
+        restart_result = {"success": True, "method": "skipped"} if no_restart else xray_api_remove_user(client_uuid)
         
         return jsonify({
             "success": True,
@@ -1295,6 +1367,9 @@ def reload_services():
             # Debounced restart — Hysteria2 does NOT support SIGHUP (process dies)
             schedule_hysteria_restart(service)
             results[service] = {"success": True, "method": "debounced", "delay_seconds": HYSTERIA_DEBOUNCE_DELAY}
+        elif service == "xray":
+            # gRPC API: users already added/removed inline, no restart needed
+            results[service] = {"success": True, "method": "grpc-api-noop"}
         else:
             results[service] = restart_service_sync(service)
     
