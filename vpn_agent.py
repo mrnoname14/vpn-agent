@@ -135,7 +135,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.4.0"
+__version__ = "4.4.1"
 
 app = Flask(__name__)
 
@@ -415,8 +415,13 @@ def write_yaml_config(path: str, data: dict):
 
 
 
-def xray_api_add_user(client_uuid: str, flow: str = "xtls-rprx-vision") -> dict:
-    """Add VLESS user via xray gRPC API - zero downtime, no restart."""
+def xray_api_add_user(client_uuid: str, flow: str = "") -> dict:
+    """Add VLESS user via xray gRPC API - zero downtime, no restart.
+
+    Default flow is empty string — required for XHTTP+Reality (current setup).
+    Legacy VLESS+Reality+TCP used flow="xtls-rprx-vision"; callers needing
+    that mode must pass it explicitly.
+    """
     email = f"{client_uuid}@vless"
     add_json = json.dumps({
         "inbounds": [{
@@ -476,10 +481,15 @@ def xray_api_remove_user(client_uuid: str) -> dict:
 @app.route("/keys/vless", methods=["POST"])
 @require_token
 def add_vless_key():
-    """Add VLESS client to xray config."""
+    """Add VLESS client to xray config.
+
+    NOTE: default flow is "" for XHTTP+Reality (current setup).
+    Legacy VLESS+Reality+TCP used flow="xtls-rprx-vision" — callers needing
+    that mode must pass it explicitly in request body.
+    """
     data = request.get_json() or {}
     client_uuid = data.get("uuid") or str(uuid.uuid4())
-    flow = data.get("flow", "xtls-rprx-vision")
+    flow = data.get("flow", "")
     
     # Validate UUID format
     if not is_valid_uuid(client_uuid):
