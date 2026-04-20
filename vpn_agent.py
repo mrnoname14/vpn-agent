@@ -135,7 +135,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.4.1"
+__version__ = "4.4.2"
 
 app = Flask(__name__)
 
@@ -455,6 +455,91 @@ def xray_api_add_user(client_uuid: str, flow: str = "") -> dict:
     except Exception as e:
         app.logger.error(f"[XRAY-GRPC] adu exception: {e}, falling back to restart")
         return restart_service_sync("xray")
+
+
+def xray_sync_config_to_live() -> dict:
+    """
+    Ensure every VLESS client in config.json is present in the live xray process.
+
+    Called from /reload after batch key operations (where individual
+    POST /keys/vless requests used no_restart=True and therefore skipped
+    the inline xray_api_add_user). This is idempotent and zero-downtime:
+    gRPC AddUser returns "already exists" for users already in live and
+    adds users that only exist in config.json.
+
+    Never modifies config.json. Never restarts xray.
+    """
+    try:
+        with open(XRAY_CONFIG) as f:
+            config = json.load(f)
+    except Exception as e:
+        app.logger.error(f"[XRAY-SYNC] failed to read config.json: {e}")
+        return {"success": False, "method": "sync-config-to-live", "error": str(e)}
+
+    vless_clients = []
+    for inbound in config.get("inbounds", []):
+        if inbound.get("protocol") == "vless":
+            for cl in inbound.get("settings", {}).get("clients", []):
+                vless_clients.append((cl.get("id"), cl.get("flow", "")))
+
+    added = 0
+    already = 0
+    errors = 0
+    for uid, flow in vless_clients:
+        if not uid:
+            continue
+        email = f"{uid}@vless"
+        add_payload = {
+            "inbounds": [{
+                "tag": XRAY_INBOUND_TAG,
+                "protocol": "vless",
+                "port": 1,
+                "settings": {
+                    "clients": [{"id": uid, "email": email, "flow": flow, "level": 0}],
+                    "decryption": "none",
+                },
+            }]
+        }
+        tmp_path = f"/tmp/xray_sync_{uid[:8]}.json"
+        try:
+            with open(tmp_path, "w") as f:
+                f.write(json.dumps(add_payload))
+            result = subprocess.run(
+                ["xray", "api", "adu", "-s", XRAY_GRPC_ADDR, tmp_path],
+                capture_output=True, text=True, timeout=5,
+            )
+            out = (result.stdout + result.stderr).lower()
+            if "already exists" in out:
+                already += 1
+            elif "result: ok" in out or "added 1" in out:
+                added += 1
+            else:
+                errors += 1
+                app.logger.warning(
+                    f"[XRAY-SYNC] adu failed for {uid[:8]}: "
+                    f"{result.stdout.strip()} {result.stderr.strip()}"
+                )
+        except Exception as e:
+            errors += 1
+            app.logger.error(f"[XRAY-SYNC] exception for {uid[:8]}: {e}")
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    app.logger.info(
+        f"[XRAY-SYNC] total={len(vless_clients)} already={already} "
+        f"added={added} errors={errors}"
+    )
+    return {
+        "success": errors == 0,
+        "method": "sync-config-to-live",
+        "total": len(vless_clients),
+        "already_in_live": already,
+        "added_to_live": added,
+        "errors": errors,
+    }
 
 
 def xray_api_remove_user(client_uuid: str) -> dict:
@@ -1378,8 +1463,16 @@ def reload_services():
             schedule_hysteria_restart(service)
             results[service] = {"success": True, "method": "debounced", "delay_seconds": HYSTERIA_DEBOUNCE_DELAY}
         elif service == "xray":
-            # gRPC API: users already added/removed inline, no restart needed
-            results[service] = {"success": True, "method": "grpc-api-noop"}
+            # Sync config.json → live xray via gRPC AddUser.
+            # Previously this was a no-op under the assumption that users
+            # were added inline via gRPC during the /keys/vless POST. That
+            # assumption was WRONG when the POST carried no_restart=True
+            # (the backend always does this for batching): the agent
+            # skipped the inline xray_api_add_user and the user never
+            # reached the live xray process — only config.json. The
+            # "already exists" response for in-live users makes this
+            # idempotent and safe to call from every /reload.
+            results[service] = xray_sync_config_to_live()
         else:
             results[service] = restart_service_sync(service)
     
