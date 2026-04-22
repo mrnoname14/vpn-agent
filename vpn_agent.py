@@ -28,6 +28,21 @@ Original Endpoints (from v1.3):
   GET  /info          - server info (uptime, load, memory, disk)
 
 
+v4.4.3 Changes:
+  - DEL-sync: DELETE /keys/vless?no_restart=true now queues the UUID in
+    /var/lib/vpn-agent/pending_xray_rmu.json; /reload (xray) consumes the
+    queue via gRPC rmu. Previously the UUID was removed from config.json
+    but stayed alive in the xray process until the next full restart —
+    revoked/migrated clients kept working until then. Two-way sync now.
+  - xray_sync_config_to_live() does ADD-sync + DEL-sync in one pass.
+  - Requires xray config with api+StatsService for future phase-2 work
+    (inactive-user alerts), but StatsService is NOT needed for v4.4.3.
+
+v4.4.2 Changes:
+  - /reload (xray) now calls xray_sync_config_to_live() which uses gRPC
+    AddUser for every VLESS client in config.json. Fixes phantom-users
+    from the prior no_restart=True + /reload-noop combination.
+
 v4.4.0 Changes:
   - Xray gRPC API for zero-downtime user management (no more systemctl restart for VLESS!)
   - add_vless_key() uses xray api adu (add user to inbound via gRPC) - 0 sec downtime
@@ -135,7 +150,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.4.2"
+__version__ = "4.4.3"
 
 app = Flask(__name__)
 
@@ -147,6 +162,12 @@ XRAY_CONFIG = "/usr/local/etc/xray/config.json"
 # Xray gRPC API address (localhost only, configured in xray config.json api section)
 XRAY_GRPC_ADDR = "127.0.0.1:10085"
 XRAY_INBOUND_TAG = "vless-in"
+
+# Persistent file tracking UUIDs that were removed from config.json
+# via DELETE /keys/vless with no_restart=true but not yet removed from
+# the live xray process via gRPC rmu. Processed on /reload (xray).
+# See xray_sync_config_to_live() for details. v4.4.3+.
+XRAY_PENDING_RMU_FILE = "/var/lib/vpn-agent/pending_xray_rmu.json"
 
 TUIC_CONFIG = "/etc/tuic/config.json"
 TUIC_CONFIG_D2 = "/etc/tuic/config-d2.json"  # Second domain
@@ -457,15 +478,60 @@ def xray_api_add_user(client_uuid: str, flow: str = "") -> dict:
         return restart_service_sync("xray")
 
 
+def _pending_rmu_read() -> list:
+    """Read pending-rmu UUID list. Returns [] if file missing/corrupt."""
+    try:
+        with open(XRAY_PENDING_RMU_FILE) as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return [u for u in data if isinstance(u, str) and u]
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        app.logger.warning(f"[XRAY-SYNC] pending_rmu read failed: {e}")
+    return []
+
+
+def _pending_rmu_write(uuids: list) -> None:
+    """Atomically overwrite pending-rmu file."""
+    try:
+        os.makedirs(os.path.dirname(XRAY_PENDING_RMU_FILE), exist_ok=True)
+        tmp = XRAY_PENDING_RMU_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(uuids, f)
+        os.replace(tmp, XRAY_PENDING_RMU_FILE)
+    except Exception as e:
+        app.logger.error(f"[XRAY-SYNC] pending_rmu write failed: {e}")
+
+
+def _pending_rmu_append(client_uuid: str) -> None:
+    """Add one UUID to pending-rmu list (dedup)."""
+    uuids = _pending_rmu_read()
+    if client_uuid not in uuids:
+        uuids.append(client_uuid)
+        _pending_rmu_write(uuids)
+
+
 def xray_sync_config_to_live() -> dict:
     """
-    Ensure every VLESS client in config.json is present in the live xray process.
+    Two-way sync between config.json and the live xray process.
 
-    Called from /reload after batch key operations (where individual
-    POST /keys/vless requests used no_restart=True and therefore skipped
-    the inline xray_api_add_user). This is idempotent and zero-downtime:
-    gRPC AddUser returns "already exists" for users already in live and
-    adds users that only exist in config.json.
+    Called from /reload after batch key operations.
+
+    ADD-sync (v4.4.2+): ensures every VLESS client in config.json is
+    present in live xray. POST /keys/vless with no_restart=True skips
+    the inline adu, so without this sync the user would never reach
+    live xray. Idempotent: gRPC adu returns "already exists" for
+    clients already in live.
+
+    DEL-sync (v4.4.3+): processes the pending-rmu file populated by
+    DELETE /keys/vless with no_restart=true (which previously removed
+    the UUID from config.json but left a phantom user in live xray,
+    letting revoked/migrated clients continue working until the next
+    full xray restart). On /reload we iterate the pending list and
+    call gRPC rmu for each UUID; successful + "not found" results
+    both clear the entry. Persisted on disk so the list survives
+    agent restarts between DELETE and /reload.
 
     Never modifies config.json. Never restarts xray.
     """
@@ -528,17 +594,59 @@ def xray_sync_config_to_live() -> dict:
             except OSError:
                 pass
 
+    # ---- DEL-sync: remove phantom users accumulated from DELETE/no_restart ----
+    pending = _pending_rmu_read()
+    removed = 0
+    not_in_live = 0
+    rmu_errors = 0
+    still_pending: list = []
+    for uid in pending:
+        email = f"{uid}@vless"
+        try:
+            result = subprocess.run(
+                ["xray", "api", "rmu", "-s", XRAY_GRPC_ADDR,
+                 "-tag", XRAY_INBOUND_TAG, email],
+                capture_output=True, text=True, timeout=5,
+            )
+            out = (result.stdout + result.stderr).lower()
+            if "removed 1" in out:
+                removed += 1
+            elif "not found" in out:
+                # already gone (e.g. xray restart between DELETE and /reload)
+                not_in_live += 1
+            else:
+                rmu_errors += 1
+                still_pending.append(uid)
+                app.logger.warning(
+                    f"[XRAY-SYNC] rmu failed for {uid[:8]}: "
+                    f"{result.stdout.strip()} {result.stderr.strip()}"
+                )
+        except Exception as e:
+            rmu_errors += 1
+            still_pending.append(uid)
+            app.logger.error(f"[XRAY-SYNC] rmu exception for {uid[:8]}: {e}")
+
+    # Keep only UUIDs that failed — they will be retried on the next /reload.
+    # Successful + "not found" are cleared.
+    _pending_rmu_write(still_pending)
+
     app.logger.info(
-        f"[XRAY-SYNC] total={len(vless_clients)} already={already} "
-        f"added={added} errors={errors}"
+        f"[XRAY-SYNC] add total={len(vless_clients)} already={already} "
+        f"added={added} add_errors={errors} | "
+        f"del pending={len(pending)} removed={removed} "
+        f"not_in_live={not_in_live} rmu_errors={rmu_errors}"
     )
     return {
-        "success": errors == 0,
+        "success": errors == 0 and rmu_errors == 0,
         "method": "sync-config-to-live",
         "total": len(vless_clients),
         "already_in_live": already,
         "added_to_live": added,
         "errors": errors,
+        "pending_rmu": len(pending),
+        "removed_from_live": removed,
+        "not_in_live": not_in_live,
+        "rmu_errors": rmu_errors,
     }
 
 
@@ -651,8 +759,15 @@ def delete_vless_key(client_uuid: str):
         write_json_config(XRAY_CONFIG, config)
         
         no_restart = request.args.get("no_restart", "false").lower() == "true"
-        restart_result = {"success": True, "method": "skipped"} if no_restart else xray_api_remove_user(client_uuid)
-        
+        if no_restart:
+            # UUID removed from config.json but still in live xray.
+            # Queue gRPC rmu for the next /reload (xray_sync_config_to_live).
+            # See XRAY_PENDING_RMU_FILE docstring. v4.4.3+.
+            _pending_rmu_append(client_uuid)
+            restart_result = {"success": True, "method": "queued-for-sync"}
+        else:
+            restart_result = xray_api_remove_user(client_uuid)
+
         return jsonify({
             "success": True,
             "deleted_uuid": client_uuid,
