@@ -150,7 +150,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.4.3"
+__version__ = "4.4.4"
 
 app = Flask(__name__)
 
@@ -162,6 +162,52 @@ XRAY_CONFIG = "/usr/local/etc/xray/config.json"
 # Xray gRPC API address (localhost only, configured in xray config.json api section)
 XRAY_GRPC_ADDR = "127.0.0.1:10085"
 XRAY_INBOUND_TAG = "vless-in"
+
+# v4.4.4 — multi-VLESS-inbound support.
+#
+# Servers running Session 17 architecture have TWO VLESS inbounds:
+#   - "vless-in"        → XHTTP transport on main IP (channel №1)
+#   - "vless-vision-in" → Vision transport on reserved IP (channel №2)
+#
+# The agent iterates all known tags so a new user is added to BOTH inbounds,
+# and a deleted user is removed from BOTH. Backwards compatible: if a server
+# has only the legacy "vless-in" inbound, the second iteration is a no-op.
+#
+# Flow semantics differ per transport:
+#   - XHTTP+Reality (vless-in)        → flow = ""
+#   - TCP+Reality+Vision (vless-vision-in) → flow = "xtls-rprx-vision"
+# We honor the caller-provided flow for vless-in (allows legacy callers to
+# still request specific flow) and force xtls-rprx-vision for Vision inbound.
+XRAY_INBOUND_TAGS = ["vless-in", "vless-vision-in"]
+INBOUND_FLOW_OVERRIDE = {
+    "vless-vision-in": "xtls-rprx-vision",
+}
+
+
+def _flow_for_inbound(tag: str, requested_flow: str) -> str:
+    """Resolve VLESS flow for a given inbound tag.
+
+    Vision inbound *requires* xtls-rprx-vision regardless of caller intent.
+    XHTTP inbound uses the caller's requested flow (default empty)."""
+    return INBOUND_FLOW_OVERRIDE.get(tag, requested_flow)
+
+
+def _list_vless_inbound_tags(config: dict) -> list:
+    """Return tags of all VLESS inbounds present in config.json, in order.
+
+    Filters XRAY_INBOUND_TAGS by what's actually configured. Legacy servers
+    with only vless-in get [vless-in]; Session 17 servers get both."""
+    present = []
+    for inbound in config.get("inbounds", []):
+        if inbound.get("protocol") != "vless":
+            continue
+        tag = inbound.get("tag")
+        if tag and tag not in present:
+            present.append(tag)
+    # Preserve XRAY_INBOUND_TAGS order for known tags; append unknown ones at end
+    ordered = [t for t in XRAY_INBOUND_TAGS if t in present]
+    extras = [t for t in present if t not in XRAY_INBOUND_TAGS]
+    return ordered + extras
 
 # Persistent file tracking UUIDs that were removed from config.json
 # via DELETE /keys/vless with no_restart=true but not yet removed from
@@ -436,17 +482,15 @@ def write_yaml_config(path: str, data: dict):
 
 
 
-def xray_api_add_user(client_uuid: str, flow: str = "") -> dict:
-    """Add VLESS user via xray gRPC API - zero downtime, no restart.
+def _xray_api_adu_to_tag(client_uuid: str, tag: str, flow: str) -> dict:
+    """Internal: gRPC adu for a SPECIFIC inbound tag. Returns ok/already/error.
 
-    Default flow is empty string — required for XHTTP+Reality (current setup).
-    Legacy VLESS+Reality+TCP used flow="xtls-rprx-vision"; callers needing
-    that mode must pass it explicitly.
+    Idempotent: 'already exists' is treated as success (user already present).
     """
     email = f"{client_uuid}@vless"
     add_json = json.dumps({
         "inbounds": [{
-            "tag": XRAY_INBOUND_TAG,
+            "tag": tag,
             "protocol": "vless",
             "port": 1,
             "settings": {
@@ -455,27 +499,78 @@ def xray_api_add_user(client_uuid: str, flow: str = "") -> dict:
             }
         }]
     })
+    tmp_path = f"/tmp/xray_adu_{client_uuid[:8]}_{tag}.json"
     try:
-        tmp_path = f"/tmp/xray_adu_{client_uuid[:8]}.json"
         with open(tmp_path, "w") as f:
             f.write(add_json)
         result = subprocess.run(
             ["xray", "api", "adu", "-s", XRAY_GRPC_ADDR, tmp_path],
             capture_output=True, text=True, timeout=5
         )
+        out = (result.stdout + result.stderr).lower()
+        if "result: ok" in out or "added 1" in out:
+            return {"success": True, "tag": tag, "state": "added"}
+        if "already exists" in out:
+            return {"success": True, "tag": tag, "state": "already_exists"}
+        return {"success": False, "tag": tag, "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip()}
+    except Exception as e:
+        return {"success": False, "tag": tag, "error": str(e)}
+    finally:
         try:
             os.remove(tmp_path)
         except OSError:
             pass
-        if "result: ok" in result.stdout.lower() or "added 1" in result.stdout.lower():
-            app.logger.info(f"[XRAY-GRPC] Added user {client_uuid[:8]}... via gRPC API")
-            return {"success": True, "method": "grpc-api"}
-        else:
-            app.logger.warning(f"[XRAY-GRPC] adu failed: {result.stdout.strip()} {result.stderr.strip()}")
-            return restart_service_sync("xray")
+
+
+def xray_api_add_user(client_uuid: str, flow: str = "") -> dict:
+    """Add VLESS user via xray gRPC API to ALL configured VLESS inbounds.
+
+    v4.4.4 — multi-inbound: iterates over all VLESS inbound tags present in
+    config.json and adds the user to each via gRPC `adu`. Per-inbound flow is
+    resolved by `_flow_for_inbound` (Vision inbounds force xtls-rprx-vision
+    regardless of caller intent; XHTTP inbounds use caller's `flow`).
+
+    Returns success=True only if at least the PRIMARY inbound (first tag)
+    succeeded. Per-inbound results are surfaced in `details` for observability.
+    Falls back to xray restart if PRIMARY add fails (preserves v4.4.3 semantics).
+
+    Default flow is empty string — required for XHTTP+Reality.
+    """
+    try:
+        config = read_json_config(XRAY_CONFIG)
     except Exception as e:
-        app.logger.error(f"[XRAY-GRPC] adu exception: {e}, falling back to restart")
+        app.logger.error(f"[XRAY-GRPC] failed to read config.json: {e}")
         return restart_service_sync("xray")
+
+    tags = _list_vless_inbound_tags(config)
+    if not tags:
+        # No VLESS inbounds at all — degenerate config. Fall back to restart.
+        app.logger.warning("[XRAY-GRPC] no VLESS inbounds in config — falling back to restart")
+        return restart_service_sync("xray")
+
+    details = []
+    primary_ok = False
+    for idx, tag in enumerate(tags):
+        per_tag_flow = _flow_for_inbound(tag, flow)
+        res = _xray_api_adu_to_tag(client_uuid, tag, per_tag_flow)
+        details.append(res)
+        if idx == 0:
+            primary_ok = res.get("success", False)
+
+    if primary_ok:
+        added_to = [d["tag"] for d in details if d.get("success")]
+        app.logger.info(
+            f"[XRAY-GRPC] Added user {client_uuid[:8]}... to {added_to}"
+        )
+        return {"success": True, "method": "grpc-api", "details": details}
+
+    # Primary failed — log and fall back to restart (matches v4.4.3 behavior).
+    app.logger.warning(
+        f"[XRAY-GRPC] adu to primary tag '{tags[0]}' failed for "
+        f"{client_uuid[:8]}: {details[0]}"
+    )
+    return restart_service_sync("xray")
 
 
 def _pending_rmu_read() -> list:
@@ -542,59 +637,82 @@ def xray_sync_config_to_live() -> dict:
         app.logger.error(f"[XRAY-SYNC] failed to read config.json: {e}")
         return {"success": False, "method": "sync-config-to-live", "error": str(e)}
 
-    vless_clients = []
+    # v4.4.4 — sync each VLESS inbound INDEPENDENTLY.
+    # Was: collected clients from all inbounds, but adu'd them only to
+    # XRAY_INBOUND_TAG (single hardcoded). Result: vless-vision-in clients
+    # never reached live xray after restart, causing channel №2 silent
+    # breakage for ~80% of users on Session-17 servers.
+    # Now: per-inbound iteration. Each client goes to ITS OWN inbound's tag,
+    # with appropriate flow forced for Vision (xtls-rprx-vision).
+    per_inbound_clients = []  # [(inbound_tag, [(uid, flow), ...])]
     for inbound in config.get("inbounds", []):
-        if inbound.get("protocol") == "vless":
-            for cl in inbound.get("settings", {}).get("clients", []):
-                vless_clients.append((cl.get("id"), cl.get("flow", "")))
+        if inbound.get("protocol") != "vless":
+            continue
+        tag = inbound.get("tag")
+        if not tag:
+            continue
+        clients = []
+        for cl in inbound.get("settings", {}).get("clients", []):
+            uid = cl.get("id")
+            if not uid:
+                continue
+            # Vision forces xtls-rprx-vision; XHTTP uses whatever's in config.
+            cl_flow = _flow_for_inbound(tag, cl.get("flow", ""))
+            clients.append((uid, cl_flow))
+        per_inbound_clients.append((tag, clients))
 
+    total_clients_seen = sum(len(cs) for _, cs in per_inbound_clients)
     added = 0
     already = 0
     errors = 0
-    for uid, flow in vless_clients:
-        if not uid:
-            continue
-        email = f"{uid}@vless"
-        add_payload = {
-            "inbounds": [{
-                "tag": XRAY_INBOUND_TAG,
-                "protocol": "vless",
-                "port": 1,
-                "settings": {
-                    "clients": [{"id": uid, "email": email, "flow": flow, "level": 0}],
-                    "decryption": "none",
-                },
-            }]
-        }
-        tmp_path = f"/tmp/xray_sync_{uid[:8]}.json"
-        try:
-            with open(tmp_path, "w") as f:
-                f.write(json.dumps(add_payload))
-            result = subprocess.run(
-                ["xray", "api", "adu", "-s", XRAY_GRPC_ADDR, tmp_path],
-                capture_output=True, text=True, timeout=5,
-            )
-            out = (result.stdout + result.stderr).lower()
-            if "already exists" in out:
-                already += 1
-            elif "result: ok" in out or "added 1" in out:
-                added += 1
-            else:
-                errors += 1
-                app.logger.warning(
-                    f"[XRAY-SYNC] adu failed for {uid[:8]}: "
-                    f"{result.stdout.strip()} {result.stderr.strip()}"
-                )
-        except Exception as e:
-            errors += 1
-            app.logger.error(f"[XRAY-SYNC] exception for {uid[:8]}: {e}")
-        finally:
+    for tag, clients in per_inbound_clients:
+        for uid, flow in clients:
+            email = f"{uid}@vless"
+            add_payload = {
+                "inbounds": [{
+                    "tag": tag,
+                    "protocol": "vless",
+                    "port": 1,
+                    "settings": {
+                        "clients": [{"id": uid, "email": email, "flow": flow, "level": 0}],
+                        "decryption": "none",
+                    },
+                }]
+            }
+            tmp_path = f"/tmp/xray_sync_{uid[:8]}_{tag}.json"
             try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+                with open(tmp_path, "w") as f:
+                    f.write(json.dumps(add_payload))
+                result = subprocess.run(
+                    ["xray", "api", "adu", "-s", XRAY_GRPC_ADDR, tmp_path],
+                    capture_output=True, text=True, timeout=5,
+                )
+                out = (result.stdout + result.stderr).lower()
+                if "already exists" in out:
+                    already += 1
+                elif "result: ok" in out or "added 1" in out:
+                    added += 1
+                else:
+                    errors += 1
+                    app.logger.warning(
+                        f"[XRAY-SYNC] adu failed for {uid[:8]} tag={tag}: "
+                        f"{result.stdout.strip()} {result.stderr.strip()}"
+                    )
+            except Exception as e:
+                errors += 1
+                app.logger.error(f"[XRAY-SYNC] exception for {uid[:8]} tag={tag}: {e}")
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
-    # ---- DEL-sync: remove phantom users accumulated from DELETE/no_restart ----
+    # ---- DEL-sync: remove phantom users from ALL VLESS inbounds ----
+    # v4.4.4 — was: rmu only from XRAY_INBOUND_TAG. Now iterates all VLESS
+    # inbound tags so phantom Vision users are also cleared.
+    # A UUID stays in `still_pending` only if AT LEAST ONE tag returned a
+    # hard error (not "not found"). 'not found' on a tag is acceptable.
+    sync_tags = [tag for tag, _ in per_inbound_clients]
     pending = _pending_rmu_read()
     removed = 0
     not_in_live = 0
@@ -602,36 +720,46 @@ def xray_sync_config_to_live() -> dict:
     still_pending: list = []
     for uid in pending:
         email = f"{uid}@vless"
-        try:
-            result = subprocess.run(
-                ["xray", "api", "rmu", "-s", XRAY_GRPC_ADDR,
-                 "-tag", XRAY_INBOUND_TAG, email],
-                capture_output=True, text=True, timeout=5,
-            )
-            out = (result.stdout + result.stderr).lower()
-            if "removed 1" in out:
-                removed += 1
-            elif "not found" in out:
-                # already gone (e.g. xray restart between DELETE and /reload)
-                not_in_live += 1
-            else:
-                rmu_errors += 1
-                still_pending.append(uid)
-                app.logger.warning(
-                    f"[XRAY-SYNC] rmu failed for {uid[:8]}: "
-                    f"{result.stdout.strip()} {result.stderr.strip()}"
+        per_uid_hard_error = False
+        per_uid_any_removed = False
+        for tag in sync_tags:
+            try:
+                result = subprocess.run(
+                    ["xray", "api", "rmu", "-s", XRAY_GRPC_ADDR,
+                     "-tag", tag, email],
+                    capture_output=True, text=True, timeout=5,
                 )
-        except Exception as e:
+                out = (result.stdout + result.stderr).lower()
+                if "removed 1" in out:
+                    per_uid_any_removed = True
+                elif "not found" in out:
+                    pass  # already gone — acceptable
+                else:
+                    per_uid_hard_error = True
+                    app.logger.warning(
+                        f"[XRAY-SYNC] rmu failed for {uid[:8]} tag={tag}: "
+                        f"{result.stdout.strip()} {result.stderr.strip()}"
+                    )
+            except Exception as e:
+                per_uid_hard_error = True
+                app.logger.error(f"[XRAY-SYNC] rmu exception for {uid[:8]} tag={tag}: {e}")
+
+        if per_uid_hard_error:
             rmu_errors += 1
             still_pending.append(uid)
-            app.logger.error(f"[XRAY-SYNC] rmu exception for {uid[:8]}: {e}")
+        elif per_uid_any_removed:
+            removed += 1
+        else:
+            not_in_live += 1
 
     # Keep only UUIDs that failed — they will be retried on the next /reload.
     # Successful + "not found" are cleared.
     _pending_rmu_write(still_pending)
 
+    inbound_summary = ",".join(f"{t}({len(c)})" for t, c in per_inbound_clients)
     app.logger.info(
-        f"[XRAY-SYNC] add total={len(vless_clients)} already={already} "
+        f"[XRAY-SYNC] inbounds=[{inbound_summary}] "
+        f"total_clients={total_clients_seen} already={already} "
         f"added={added} add_errors={errors} | "
         f"del pending={len(pending)} removed={removed} "
         f"not_in_live={not_in_live} rmu_errors={rmu_errors}"
@@ -639,7 +767,8 @@ def xray_sync_config_to_live() -> dict:
     return {
         "success": errors == 0 and rmu_errors == 0,
         "method": "sync-config-to-live",
-        "total": len(vless_clients),
+        "total": total_clients_seen,
+        "inbounds": [{"tag": t, "clients": len(c)} for t, c in per_inbound_clients],
         "already_in_live": already,
         "added_to_live": added,
         "errors": errors,
@@ -650,23 +779,69 @@ def xray_sync_config_to_live() -> dict:
     }
 
 
-def xray_api_remove_user(client_uuid: str) -> dict:
-    """Remove VLESS user via xray gRPC API - zero downtime, no restart."""
+def _xray_api_rmu_from_tag(client_uuid: str, tag: str) -> dict:
+    """Internal: gRPC rmu from a SPECIFIC inbound tag.
+
+    'not found' is treated as success (user already absent — same end state).
+    """
     email = f"{client_uuid}@vless"
     try:
         result = subprocess.run(
-            ["xray", "api", "rmu", "-s", XRAY_GRPC_ADDR, "-tag", XRAY_INBOUND_TAG, email],
+            ["xray", "api", "rmu", "-s", XRAY_GRPC_ADDR, "-tag", tag, email],
             capture_output=True, text=True, timeout=5
         )
-        if "removed 1" in result.stdout.lower():
-            app.logger.info(f"[XRAY-GRPC] Removed user {client_uuid[:8]}... via gRPC API")
-            return {"success": True, "method": "grpc-api"}
-        else:
-            app.logger.warning(f"[XRAY-GRPC] rmu failed: {result.stdout.strip()} {result.stderr.strip()}")
-            return restart_service_sync("xray")
+        out = (result.stdout + result.stderr).lower()
+        if "removed 1" in out:
+            return {"success": True, "tag": tag, "state": "removed"}
+        if "not found" in out:
+            return {"success": True, "tag": tag, "state": "not_found"}
+        return {"success": False, "tag": tag, "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip()}
     except Exception as e:
-        app.logger.error(f"[XRAY-GRPC] rmu exception: {e}, falling back to restart")
+        return {"success": False, "tag": tag, "error": str(e)}
+
+
+def xray_api_remove_user(client_uuid: str) -> dict:
+    """Remove VLESS user via xray gRPC API from ALL configured VLESS inbounds.
+
+    v4.4.4 — multi-inbound: removes user from every VLESS inbound. 'not found'
+    on a tag is acceptable (same end state). Considers operation successful if
+    primary tag (first) returned removed/not_found, even if a secondary tag
+    errored — degraded but the channel №1 user is gone.
+
+    Falls back to xray restart only on hard failure of the primary tag.
+    """
+    try:
+        config = read_json_config(XRAY_CONFIG)
+    except Exception as e:
+        app.logger.error(f"[XRAY-GRPC] failed to read config.json: {e}")
         return restart_service_sync("xray")
+
+    tags = _list_vless_inbound_tags(config)
+    if not tags:
+        app.logger.warning("[XRAY-GRPC] no VLESS inbounds — falling back to restart")
+        return restart_service_sync("xray")
+
+    details = []
+    primary_ok = False
+    for idx, tag in enumerate(tags):
+        res = _xray_api_rmu_from_tag(client_uuid, tag)
+        details.append(res)
+        if idx == 0:
+            primary_ok = res.get("success", False)
+
+    if primary_ok:
+        removed_from = [d["tag"] for d in details if d.get("success")]
+        app.logger.info(
+            f"[XRAY-GRPC] Removed user {client_uuid[:8]}... from {removed_from}"
+        )
+        return {"success": True, "method": "grpc-api", "details": details}
+
+    app.logger.warning(
+        f"[XRAY-GRPC] rmu from primary tag '{tags[0]}' failed for "
+        f"{client_uuid[:8]}: {details[0]}"
+    )
+    return restart_service_sync("xray")
 
 
 # ==================== VLESS (xray) ====================
@@ -674,7 +849,22 @@ def xray_api_remove_user(client_uuid: str) -> dict:
 @app.route("/keys/vless", methods=["POST"])
 @require_token
 def add_vless_key():
-    """Add VLESS client to xray config.
+    """Add VLESS client to xray config (all VLESS inbounds).
+
+    v4.4.4 — multi-inbound aware. Adds the UUID to EVERY VLESS inbound in
+    config.json (legacy single-inbound servers + Session-17 dual-inbound
+    servers). Per-inbound flow is resolved by `_flow_for_inbound`:
+      - vless-in            → caller-provided flow (default "")
+      - vless-vision-in     → "xtls-rprx-vision" (forced — Vision splitting
+                              cannot work without it)
+
+    Backwards compatible: response payload preserves `flow` field as the
+    flow used for the PRIMARY inbound (matches v4.4.3 callers' expectations).
+
+    UUID-already-exists check is done across ALL inbounds; we return 409
+    only if it exists in the PRIMARY inbound (so re-add to a server that
+    has the user only in vless-in but missing from vless-vision-in is NOT
+    treated as an error — instead it heals the missing inbound).
 
     NOTE: default flow is "" for XHTTP+Reality (current setup).
     Legacy VLESS+Reality+TCP used flow="xtls-rprx-vision" — callers needing
@@ -683,49 +873,60 @@ def add_vless_key():
     data = request.get_json() or {}
     client_uuid = data.get("uuid") or str(uuid.uuid4())
     flow = data.get("flow", "")
-    
+
     # Validate UUID format
     if not is_valid_uuid(client_uuid):
         return jsonify({"error": "Invalid UUID format", "uuid": client_uuid}), 400
-    
+
     try:
         config = read_json_config(XRAY_CONFIG)
-        
-        # Find VLESS inbound
-        vless_inbound = None
-        for inbound in config.get("inbounds", []):
-            if inbound.get("protocol") == "vless":
-                vless_inbound = inbound
-                break
-        
-        if not vless_inbound:
+
+        # Collect all VLESS inbounds (v4.4.4 — was: just first one)
+        vless_inbounds = [
+            i for i in config.get("inbounds", []) if i.get("protocol") == "vless"
+        ]
+
+        if not vless_inbounds:
             return jsonify({"error": "VLESS inbound not found in config"}), 500
-        
-        # Check if UUID already exists
-        clients = vless_inbound.get("settings", {}).get("clients", [])
-        for client in clients:
-            if client.get("id") == client_uuid:
-                return jsonify({"error": "UUID already exists", "uuid": client_uuid}), 409
-        
-        # Add new client
-        new_client = {"id": client_uuid, "flow": flow}
-        clients.append(new_client)
-        vless_inbound["settings"]["clients"] = clients
-        
+
+        # 409 only if user is in the PRIMARY inbound (matches v4.4.3 semantics
+        # for legacy callers; Session-17 partial-drift recovery is allowed).
+        primary = vless_inbounds[0]
+        primary_clients = primary.get("settings", {}).get("clients", [])
+        if any(c.get("id") == client_uuid for c in primary_clients):
+            return jsonify({"error": "UUID already exists", "uuid": client_uuid}), 409
+
+        # Add new client to each VLESS inbound (idempotent per inbound).
+        added_to = []
+        for inbound in vless_inbounds:
+            tag = inbound.get("tag", "vless-in")
+            clients = inbound.get("settings", {}).get("clients", [])
+            if any(c.get("id") == client_uuid for c in clients):
+                continue  # already there — skip silently
+            client_flow = _flow_for_inbound(tag, flow)
+            clients.append({"id": client_uuid, "flow": client_flow})
+            inbound.setdefault("settings", {})["clients"] = clients
+            added_to.append(tag)
+
         write_json_config(XRAY_CONFIG, config)
-        
-        # Add user via gRPC API (zero downtime) or skip if no_restart
+
+        # Add user via gRPC API (zero downtime) or skip if no_restart.
+        # xray_api_add_user is multi-inbound aware (v4.4.4) — handles all tags.
         no_restart = data.get("no_restart", False)
-        restart_result = {"success": True, "method": "skipped"} if no_restart else xray_api_add_user(client_uuid, flow)
-        
+        restart_result = (
+            {"success": True, "method": "skipped"}
+            if no_restart else xray_api_add_user(client_uuid, flow)
+        )
+
         return jsonify({
             "success": True,
             "uuid": client_uuid,
             "flow": flow,
+            "added_to_inbounds": added_to,
             "restart": restart_result,
-            "total_clients": len(clients)
+            "total_clients": len(primary.get("settings", {}).get("clients", []))
         })
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -733,31 +934,42 @@ def add_vless_key():
 @app.route("/keys/vless/<client_uuid>", methods=["DELETE"])
 @require_token
 def delete_vless_key(client_uuid: str):
-    """Remove VLESS client from xray config."""
+    """Remove VLESS client from xray config (all VLESS inbounds).
+
+    v4.4.4 — multi-inbound aware. Removes UUID from EVERY VLESS inbound it
+    appears in. 404 returned only if UUID is not present in ANY inbound (so
+    a partial-drift situation where UUID is in vless-in but missing from
+    vless-vision-in still successfully removes from vless-in).
+    """
     try:
         config = read_json_config(XRAY_CONFIG)
-        
-        vless_inbound = None
-        for inbound in config.get("inbounds", []):
-            if inbound.get("protocol") == "vless":
-                vless_inbound = inbound
-                break
-        
-        if not vless_inbound:
+
+        vless_inbounds = [
+            i for i in config.get("inbounds", []) if i.get("protocol") == "vless"
+        ]
+        if not vless_inbounds:
             return jsonify({"error": "VLESS inbound not found"}), 500
-        
-        clients = vless_inbound.get("settings", {}).get("clients", [])
-        original_count = len(clients)
-        
-        # Remove client
-        clients = [c for c in clients if c.get("id") != client_uuid]
-        
-        if len(clients) == original_count:
+
+        # Remove UUID from each inbound, track removals + final primary count.
+        removed_from = []
+        primary_count = 0
+        for idx, inbound in enumerate(vless_inbounds):
+            tag = inbound.get("tag", "vless-in")
+            clients = inbound.get("settings", {}).get("clients", [])
+            before = len(clients)
+            clients = [c for c in clients if c.get("id") != client_uuid]
+            after = len(clients)
+            inbound.setdefault("settings", {})["clients"] = clients
+            if after < before:
+                removed_from.append(tag)
+            if idx == 0:
+                primary_count = after
+
+        if not removed_from:
             return jsonify({"error": "UUID not found"}), 404
-        
-        vless_inbound["settings"]["clients"] = clients
+
         write_json_config(XRAY_CONFIG, config)
-        
+
         no_restart = request.args.get("no_restart", "false").lower() == "true"
         if no_restart:
             # UUID removed from config.json but still in live xray.
@@ -771,10 +983,11 @@ def delete_vless_key(client_uuid: str):
         return jsonify({
             "success": True,
             "deleted_uuid": client_uuid,
+            "removed_from_inbounds": removed_from,
             "restart": restart_result,
-            "total_clients": len(clients)
+            "total_clients": primary_count
         })
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -782,21 +995,48 @@ def delete_vless_key(client_uuid: str):
 @app.route("/keys/vless", methods=["GET"])
 @require_token
 def list_vless_keys():
-    """List all VLESS clients."""
+    """List VLESS clients.
+
+    v4.4.4 — multi-inbound aware. Returns:
+      - top-level `clients` / `count` / `flow`: from PRIMARY inbound (vless-in)
+        → backwards-compatible with v4.4.3 callers (existing backend code that
+        compares by `clients[*].uuid` keeps working without change).
+      - `inbounds`: per-inbound breakdown for new callers — each entry has
+        {tag, count, clients[]} so backend can audit Vision separately.
+
+    On legacy single-inbound servers, `inbounds` will have just one entry
+    (vless-in) and the response shape is structurally a superset of v4.4.3.
+    """
     try:
         config = read_json_config(XRAY_CONFIG)
-        
-        for inbound in config.get("inbounds", []):
-            if inbound.get("protocol") == "vless":
-                clients = inbound.get("settings", {}).get("clients", [])
-                return jsonify({
-                    "protocol": "vless",
-                    "count": len(clients),
-                    "clients": [{"uuid": c.get("id"), "flow": c.get("flow")} for c in clients]
-                })
-        
-        return jsonify({"error": "VLESS inbound not found"}), 500
-        
+
+        vless_inbounds = [
+            i for i in config.get("inbounds", []) if i.get("protocol") == "vless"
+        ]
+        if not vless_inbounds:
+            return jsonify({"error": "VLESS inbound not found"}), 500
+
+        per_inbound = []
+        for inbound in vless_inbounds:
+            tag = inbound.get("tag", "")
+            clients = inbound.get("settings", {}).get("clients", [])
+            per_inbound.append({
+                "tag": tag,
+                "count": len(clients),
+                "clients": [
+                    {"uuid": c.get("id"), "flow": c.get("flow")}
+                    for c in clients
+                ],
+            })
+
+        primary = per_inbound[0]
+        return jsonify({
+            "protocol": "vless",
+            "count": primary["count"],
+            "clients": primary["clients"],
+            "inbounds": per_inbound,
+        })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
