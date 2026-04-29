@@ -1,7 +1,46 @@
 #!/usr/bin/env python3
 """
-VPN Key Agent v4.4.0
+VPN Key Agent v4.5.2
 Extended VPN Health Agent with key management for multi-user support.
+
+v4.5.2 Changes (Session 19 hotfix #2 — heal partial drift):
+  - add_vless_key(): 409 "already exists" only when UUID is in ALL VLESS
+    inbounds. If UUID is in vless-in but missing from vless-vision-in
+    (or vice versa), agent now ADDs the UUID to the missing inbound
+    instead of refusing with 409. Inherited bug from v4.4.4 made the
+    drift_monitor unable to heal partial drift through the agent —
+    it kept getting 409 even when the secondary inbound was missing
+    the UUID.
+  - delete_vless_key() unaffected (already iterates all inbounds).
+
+v4.5.1 Changes (Session 19 hotfix — xray gRPC adu storm fix):
+  - xray_sync_config_to_live(): added idempotent guard via `xray api lsi`.
+    Before: every /reload re-issued `adu` for every UUID, even ones already
+    in xray runtime. Repeated adu of same UUID can drive xray-core 26.3.27
+    internal user index into an inconsistent state — handshake validation
+    starts behaving randomly, both VLESS channels stop accepting their
+    legitimate users until the xray process is restarted.
+    Now: lsi snapshot first, adu only for UUIDs not already in runtime.
+    Drops typical /reload from O(N_users) gRPC writes to O(0) on a healthy
+    server, removes the storm pattern entirely.
+  - Same guard applies to both vless-in (xray-vless on :10085) and
+    vless-vision-in (xray-vision on :10086) in split layout.
+
+v4.5.0 Changes (Session 19 — split xray layout):
+  - Added support for two independent xray processes:
+      xray-vless.service   /etc/xray-vless/config.json    127.0.0.1:10085
+      xray-vision.service  /etc/xray-vision/config.json   127.0.0.1:10086
+    Each VLESS inbound (vless-in / vless-vision-in) now lives in its own
+    xray process — restart of one no longer drops the other channel.
+  - Layout detection: `systemctl is-active xray-vless` (5s cache).
+    Active → split layout. Otherwise legacy single xray.service path.
+  - VLESS POST/DELETE/list iterate the tag→config/grpc binding so writes
+    land in the right config and adu/rmu hits the right gRPC endpoint.
+  - VPN_SERVICES, /reload, /restart/{svc}, /health are layout-aware.
+  - `/restart/xray` in split layout fans out to both xray-vless and
+    xray-vision (backward-compat for unmodified backend callers).
+  - Legacy single-xray servers behave exactly as before — no changes
+    needed on the 10 servers we haven't migrated yet.
 
 New Endpoints:
   POST   /keys/vless          - Add VLESS client (UUID)
@@ -150,7 +189,7 @@ import threading
 from functools import wraps
 from flask import Flask, jsonify, request
 
-__version__ = "4.4.4"
+__version__ = "4.5.2"
 
 app = Flask(__name__)
 
@@ -182,6 +221,98 @@ XRAY_INBOUND_TAGS = ["vless-in", "vless-vision-in"]
 INBOUND_FLOW_OVERRIDE = {
     "vless-vision-in": "xtls-rprx-vision",
 }
+
+# v4.5.0 — split-xray layout detection.
+#
+# Split layout: two independent xray processes, one per VLESS inbound.
+#   vless-in        → xray-vless.service   /etc/xray-vless/config.json    127.0.0.1:10085
+#   vless-vision-in → xray-vision.service  /etc/xray-vision/config.json   127.0.0.1:10086
+#
+# Single layout (legacy): one xray.service with both inbounds in one config.
+#   vless-in, vless-vision-in → /usr/local/etc/xray/config.json  127.0.0.1:10085
+#
+# Detection runs `systemctl is-active xray-vless` and caches the answer
+# briefly — every gRPC call hits this path, so we don't want to fork
+# systemctl on every request, and we don't want to cache for so long
+# that a freshly-migrated server takes minutes for the agent to notice.
+_LAYOUT_CACHE = {"value": None, "ts": 0.0}
+_LAYOUT_CACHE_TTL_SEC = 5.0
+
+XRAY_SPLIT_VLESS_CONFIG = "/etc/xray-vless/config.json"
+XRAY_SPLIT_VISION_CONFIG = "/etc/xray-vision/config.json"
+XRAY_SPLIT_VLESS_GRPC = "127.0.0.1:10085"
+XRAY_SPLIT_VISION_GRPC = "127.0.0.1:10086"
+XRAY_SPLIT_VLESS_SERVICE = "xray-vless"
+XRAY_SPLIT_VISION_SERVICE = "xray-vision"
+
+# (config_path, grpc_addr, service_name) per tag, valid only in split layout.
+_TAG_BINDING_SPLIT = {
+    "vless-in": (XRAY_SPLIT_VLESS_CONFIG, XRAY_SPLIT_VLESS_GRPC, XRAY_SPLIT_VLESS_SERVICE),
+    "vless-vision-in": (XRAY_SPLIT_VISION_CONFIG, XRAY_SPLIT_VISION_GRPC, XRAY_SPLIT_VISION_SERVICE),
+}
+
+
+def xray_layout() -> str:
+    """Return 'split' if xray-vless.service is active, else 'single'.
+
+    Cached briefly to avoid per-request systemctl forks while still
+    picking up a layout change quickly after migration.
+    """
+    now = time.time()
+    if _LAYOUT_CACHE["value"] and now - _LAYOUT_CACHE["ts"] < _LAYOUT_CACHE_TTL_SEC:
+        return _LAYOUT_CACHE["value"]
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", "xray-vless"],
+            capture_output=True, text=True, timeout=3,
+        )
+        layout = "split" if r.stdout.strip() == "active" else "single"
+    except Exception:
+        layout = "single"
+    _LAYOUT_CACHE["value"] = layout
+    _LAYOUT_CACHE["ts"] = now
+    return layout
+
+
+def _binding_for_tag(tag: str) -> tuple:
+    """(config_path, grpc_addr, service_name) for an inbound tag."""
+    if xray_layout() == "split" and tag in _TAG_BINDING_SPLIT:
+        return _TAG_BINDING_SPLIT[tag]
+    return (XRAY_CONFIG, XRAY_GRPC_ADDR, "xray")
+
+
+def xray_config_paths() -> list:
+    """All xray config files in current layout (in tag order)."""
+    if xray_layout() == "split":
+        return [XRAY_SPLIT_VLESS_CONFIG, XRAY_SPLIT_VISION_CONFIG]
+    return [XRAY_CONFIG]
+
+
+def xray_services_for_layout() -> list:
+    """Services that systemd manages for xray in current layout."""
+    if xray_layout() == "split":
+        return [XRAY_SPLIT_VLESS_SERVICE, XRAY_SPLIT_VISION_SERVICE]
+    return ["xray"]
+
+
+def _iter_vless_locations() -> list:
+    """Yield (config_path, inbound_dict, grpc_addr, service_name) for every
+    VLESS inbound in current layout — abstracts single-vs-split for callers
+    that need to read or mutate every VLESS inbound."""
+    out = []
+    for path in xray_config_paths():
+        try:
+            cfg = read_json_config(path)
+        except Exception as e:
+            app.logger.warning(f"[XRAY-CFG] read failed {path}: {e}")
+            continue
+        for inb in cfg.get("inbounds", []):
+            if inb.get("protocol") != "vless":
+                continue
+            tag = inb.get("tag", "vless-in")
+            _cfg, grpc_addr, svc = _binding_for_tag(tag)
+            out.append((path, inb, grpc_addr, svc))
+    return out
 
 
 def _flow_for_inbound(tag: str, requested_flow: str) -> str:
@@ -239,15 +370,24 @@ SERVICE_MAP = {
     "hysteria2": "hysteria",
 }
 
-VPN_SERVICES = [
+_VPN_SERVICES_BASE = [
     "hysteria",
     "hysteria-d2",
     "tuic",
     "tuic-d2",
-    "xray",
     # "shadowsocks",  # Disabled: SS stopped intentionally (DPI risk 6/10)
     # "AdGuardHome",  # Removed Phase 2.97: caused 3-7s delays on YouTube/Instagram
 ]
+
+
+def vpn_services() -> list:
+    """List of services to health-check / restart-all on this server.
+
+    v4.5.0 — xray entry depends on layout: split layout reports both
+    xray-vless and xray-vision so /health surfaces them independently;
+    single layout reports legacy `xray`.
+    """
+    return _VPN_SERVICES_BASE + xray_services_for_layout()
 
 # ==================== TUIC DEBOUNCE RESTART ====================
 # TUIC does not support SIGHUP, so we batch config changes and
@@ -368,7 +508,25 @@ def is_valid_uuid(uuid_string: str) -> bool:
 
 
 def restart_service_sync(service: str, timeout: int = 30) -> dict:
-    """Restart a service and return status."""
+    """Restart a service and return status.
+
+    v4.5.0 — when the caller asks to restart legacy `xray` on a split-layout
+    server we fan out to both xray-vless and xray-vision sequentially.
+    Sequential (not parallel) so the brief SO_REUSEPORT-less downtime is
+    isolated to one channel at a time. Backend code that still says
+    `xray` keeps working.
+    """
+    if service == "xray" and xray_layout() == "split":
+        results = {}
+        for svc in (XRAY_SPLIT_VLESS_SERVICE, XRAY_SPLIT_VISION_SERVICE):
+            results[svc] = restart_service_sync(svc, timeout=timeout)
+        all_ok = all(r.get("success") for r in results.values())
+        return {
+            "success": all_ok,
+            "method": "split-fanout",
+            "services": results,
+        }
+
     try:
         result = subprocess.run(
             ["systemctl", "restart", service],
@@ -376,9 +534,9 @@ def restart_service_sync(service: str, timeout: int = 30) -> dict:
         )
         if result.returncode != 0:
             return {"success": False, "error": result.stderr.strip() or "Restart failed"}
-        
+
         time.sleep(2)
-        
+
         # Check if active
         result = subprocess.run(
             ["systemctl", "is-active", service],
@@ -482,12 +640,52 @@ def write_yaml_config(path: str, data: dict):
 
 
 
+def _xray_api_lsi_uuids(grpc_addr: str, tag: str) -> tuple:
+    """v4.5.1 — return (uuids_set, ok_flag) of UUIDs currently in xray runtime
+    for the given inbound tag at the given gRPC endpoint.
+
+    `xray api lsi` returns the live inbound table (config-loaded clients
+    + runtime-added clients via gRPC adu — both sources unified). We use
+    this set as an idempotent guard before issuing adu in sync paths:
+    if the UUID is already there, skip the adu entirely. This stops the
+    "adu storm" pattern that was driving xray-core 26.3.27 user index
+    into inconsistent state on /reload.
+
+    Returns ({set of uuid strings}, True) on success, (empty set, False)
+    on any error so callers can choose to fall back to unconditional adu.
+    """
+    try:
+        result = subprocess.run(
+            ["xray", "api", "lsi", "-s", grpc_addr],
+            capture_output=True, text=True, timeout=8,
+        )
+        if result.returncode != 0:
+            return (set(), False)
+        data = json.loads(result.stdout)
+        uuids = set()
+        for inb in data.get("inbounds", []):
+            if inb.get("tag") != tag:
+                continue
+            clients = inb.get("proxySettings", {}).get("clients", [])
+            for cl in clients:
+                uid = (cl.get("account") or {}).get("id")
+                if uid:
+                    uuids.add(uid)
+        return (uuids, True)
+    except Exception as e:
+        app.logger.warning(f"[XRAY-SYNC] lsi failed for {tag}@{grpc_addr}: {e}")
+        return (set(), False)
+
+
 def _xray_api_adu_to_tag(client_uuid: str, tag: str, flow: str) -> dict:
     """Internal: gRPC adu for a SPECIFIC inbound tag. Returns ok/already/error.
 
     Idempotent: 'already exists' is treated as success (user already present).
+    v4.5.0 — gRPC address is resolved per tag via _binding_for_tag, so split
+    layout sends vless-vision-in to :10086 instead of :10085.
     """
     email = f"{client_uuid}@vless"
+    _cfg_path, grpc_addr, _svc = _binding_for_tag(tag)
     add_json = json.dumps({
         "inbounds": [{
             "tag": tag,
@@ -504,7 +702,7 @@ def _xray_api_adu_to_tag(client_uuid: str, tag: str, flow: str) -> dict:
         with open(tmp_path, "w") as f:
             f.write(add_json)
         result = subprocess.run(
-            ["xray", "api", "adu", "-s", XRAY_GRPC_ADDR, tmp_path],
+            ["xray", "api", "adu", "-s", grpc_addr, tmp_path],
             capture_output=True, text=True, timeout=5
         )
         out = (result.stdout + result.stderr).lower()
@@ -536,18 +734,29 @@ def xray_api_add_user(client_uuid: str, flow: str = "") -> dict:
     Falls back to xray restart if PRIMARY add fails (preserves v4.4.3 semantics).
 
     Default flow is empty string — required for XHTTP+Reality.
+    v4.5.0 — discovers VLESS inbounds across all xray configs in current
+    layout (one in single, two in split), so users get added to both
+    channels regardless of which xray process owns each.
     """
-    try:
-        config = read_json_config(XRAY_CONFIG)
-    except Exception as e:
-        app.logger.error(f"[XRAY-GRPC] failed to read config.json: {e}")
+    locations = _iter_vless_locations()
+    if not locations:
+        # No VLESS inbounds at all — degenerate config. Fall back to restart.
+        app.logger.warning("[XRAY-GRPC] no VLESS inbounds — falling back to restart")
         return restart_service_sync("xray")
 
-    tags = _list_vless_inbound_tags(config)
-    if not tags:
-        # No VLESS inbounds at all — degenerate config. Fall back to restart.
-        app.logger.warning("[XRAY-GRPC] no VLESS inbounds in config — falling back to restart")
-        return restart_service_sync("xray")
+    # Build ordered tag list (preserve XRAY_INBOUND_TAGS order so vless-in
+    # is always primary). _iter_vless_locations already deduplicates per
+    # (config, inbound) pair.
+    seen = set()
+    tags = []
+    for _path, inb, _grpc, _svc in locations:
+        t = inb.get("tag", "vless-in")
+        if t in seen:
+            continue
+        seen.add(t)
+        tags.append(t)
+    tags = [t for t in XRAY_INBOUND_TAGS if t in tags] + \
+           [t for t in tags if t not in XRAY_INBOUND_TAGS]
 
     details = []
     primary_ok = False
@@ -565,12 +774,14 @@ def xray_api_add_user(client_uuid: str, flow: str = "") -> dict:
         )
         return {"success": True, "method": "grpc-api", "details": details}
 
-    # Primary failed — log and fall back to restart (matches v4.4.3 behavior).
+    # Primary failed — log and fall back to restart of the primary's service.
+    primary_tag = tags[0]
+    _cfg, _grpc, primary_service = _binding_for_tag(primary_tag)
     app.logger.warning(
-        f"[XRAY-GRPC] adu to primary tag '{tags[0]}' failed for "
-        f"{client_uuid[:8]}: {details[0]}"
+        f"[XRAY-GRPC] adu to primary tag '{primary_tag}' failed for "
+        f"{client_uuid[:8]}: {details[0]} — restarting {primary_service}"
     )
-    return restart_service_sync("xray")
+    return restart_service_sync(primary_service)
 
 
 def _pending_rmu_read() -> list:
@@ -628,45 +839,60 @@ def xray_sync_config_to_live() -> dict:
     both clear the entry. Persisted on disk so the list survives
     agent restarts between DELETE and /reload.
 
-    Never modifies config.json. Never restarts xray.
+    Never modifies config files. Never restarts xray.
+    v4.5.0 — iterates all xray config files in current layout. In split
+    layout each VLESS inbound has its own (config, gRPC endpoint) pair, so
+    adu/rmu hit the right xray process automatically.
     """
-    try:
-        with open(XRAY_CONFIG) as f:
-            config = json.load(f)
-    except Exception as e:
-        app.logger.error(f"[XRAY-SYNC] failed to read config.json: {e}")
-        return {"success": False, "method": "sync-config-to-live", "error": str(e)}
-
-    # v4.4.4 — sync each VLESS inbound INDEPENDENTLY.
-    # Was: collected clients from all inbounds, but adu'd them only to
-    # XRAY_INBOUND_TAG (single hardcoded). Result: vless-vision-in clients
-    # never reached live xray after restart, causing channel №2 silent
-    # breakage for ~80% of users on Session-17 servers.
-    # Now: per-inbound iteration. Each client goes to ITS OWN inbound's tag,
-    # with appropriate flow forced for Vision (xtls-rprx-vision).
-    per_inbound_clients = []  # [(inbound_tag, [(uid, flow), ...])]
-    for inbound in config.get("inbounds", []):
-        if inbound.get("protocol") != "vless":
-            continue
-        tag = inbound.get("tag")
+    # v4.5.0 — sync each VLESS inbound INDEPENDENTLY across all configs.
+    # Was: read one XRAY_CONFIG and one XRAY_GRPC_ADDR. Now: walk every
+    # config returned by _iter_vless_locations() so split layout (two
+    # files, two gRPC ports) is handled transparently.
+    locations = _iter_vless_locations()
+    # per_inbound_clients: [(tag, grpc_addr, [(uid, flow), ...])]
+    per_inbound_clients = []
+    for _path, inb, grpc_addr, _svc in locations:
+        tag = inb.get("tag")
         if not tag:
             continue
         clients = []
-        for cl in inbound.get("settings", {}).get("clients", []):
+        for cl in inb.get("settings", {}).get("clients", []):
             uid = cl.get("id")
             if not uid:
                 continue
             # Vision forces xtls-rprx-vision; XHTTP uses whatever's in config.
             cl_flow = _flow_for_inbound(tag, cl.get("flow", ""))
             clients.append((uid, cl_flow))
-        per_inbound_clients.append((tag, clients))
+        per_inbound_clients.append((tag, grpc_addr, clients))
 
-    total_clients_seen = sum(len(cs) for _, cs in per_inbound_clients)
+    if not per_inbound_clients:
+        app.logger.warning("[XRAY-SYNC] no VLESS inbounds discovered in any config")
+        return {"success": False, "method": "sync-config-to-live",
+                "error": "no VLESS inbounds"}
+
+    total_clients_seen = sum(len(cs) for _, _, cs in per_inbound_clients)
     added = 0
     already = 0
     errors = 0
-    for tag, clients in per_inbound_clients:
+    skipped_lsi = 0  # v4.5.1 — counted separately for visibility
+    for tag, grpc_addr, clients in per_inbound_clients:
+        # v4.5.1 — idempotent guard: snapshot runtime UUIDs once, skip adu
+        # for any UUID already present. Eliminates the "adu storm" that
+        # corrupted xray-core 26.3.27 user index. If lsi fails (e.g. xray
+        # restarting) fall back to unconditional adu — old behavior.
+        existing_uuids, lsi_ok = _xray_api_lsi_uuids(grpc_addr, tag)
+        if lsi_ok:
+            app.logger.info(
+                f"[XRAY-SYNC] lsi tag={tag} grpc={grpc_addr} "
+                f"runtime_count={len(existing_uuids)} config_count={len(clients)}"
+            )
         for uid, flow in clients:
+            if lsi_ok and uid in existing_uuids:
+                # Already in runtime — skip adu. Counts as "already" for
+                # the response payload (backwards-compatible signal).
+                already += 1
+                skipped_lsi += 1
+                continue
             email = f"{uid}@vless"
             add_payload = {
                 "inbounds": [{
@@ -684,7 +910,7 @@ def xray_sync_config_to_live() -> dict:
                 with open(tmp_path, "w") as f:
                     f.write(json.dumps(add_payload))
                 result = subprocess.run(
-                    ["xray", "api", "adu", "-s", XRAY_GRPC_ADDR, tmp_path],
+                    ["xray", "api", "adu", "-s", grpc_addr, tmp_path],
                     capture_output=True, text=True, timeout=5,
                 )
                 out = (result.stdout + result.stderr).lower()
@@ -695,8 +921,9 @@ def xray_sync_config_to_live() -> dict:
                 else:
                     errors += 1
                     app.logger.warning(
-                        f"[XRAY-SYNC] adu failed for {uid[:8]} tag={tag}: "
-                        f"{result.stdout.strip()} {result.stderr.strip()}"
+                        f"[XRAY-SYNC] adu failed for {uid[:8]} tag={tag} "
+                        f"grpc={grpc_addr}: {result.stdout.strip()} "
+                        f"{result.stderr.strip()}"
                     )
             except Exception as e:
                 errors += 1
@@ -708,11 +935,11 @@ def xray_sync_config_to_live() -> dict:
                     pass
 
     # ---- DEL-sync: remove phantom users from ALL VLESS inbounds ----
-    # v4.4.4 — was: rmu only from XRAY_INBOUND_TAG. Now iterates all VLESS
-    # inbound tags so phantom Vision users are also cleared.
+    # v4.5.0 — was: single XRAY_GRPC_ADDR. Now: per-tag grpc_addr so split
+    # layout removes vless-vision-in users via :10086.
     # A UUID stays in `still_pending` only if AT LEAST ONE tag returned a
     # hard error (not "not found"). 'not found' on a tag is acceptable.
-    sync_tags = [tag for tag, _ in per_inbound_clients]
+    sync_tags_with_addr = [(tag, grpc_addr) for tag, grpc_addr, _ in per_inbound_clients]
     pending = _pending_rmu_read()
     removed = 0
     not_in_live = 0
@@ -722,10 +949,10 @@ def xray_sync_config_to_live() -> dict:
         email = f"{uid}@vless"
         per_uid_hard_error = False
         per_uid_any_removed = False
-        for tag in sync_tags:
+        for tag, grpc_addr in sync_tags_with_addr:
             try:
                 result = subprocess.run(
-                    ["xray", "api", "rmu", "-s", XRAY_GRPC_ADDR,
+                    ["xray", "api", "rmu", "-s", grpc_addr,
                      "-tag", tag, email],
                     capture_output=True, text=True, timeout=5,
                 )
@@ -737,8 +964,9 @@ def xray_sync_config_to_live() -> dict:
                 else:
                     per_uid_hard_error = True
                     app.logger.warning(
-                        f"[XRAY-SYNC] rmu failed for {uid[:8]} tag={tag}: "
-                        f"{result.stdout.strip()} {result.stderr.strip()}"
+                        f"[XRAY-SYNC] rmu failed for {uid[:8]} tag={tag} "
+                        f"grpc={grpc_addr}: {result.stdout.strip()} "
+                        f"{result.stderr.strip()}"
                     )
             except Exception as e:
                 per_uid_hard_error = True
@@ -756,20 +984,28 @@ def xray_sync_config_to_live() -> dict:
     # Successful + "not found" are cleared.
     _pending_rmu_write(still_pending)
 
-    inbound_summary = ",".join(f"{t}({len(c)})" for t, c in per_inbound_clients)
+    inbound_summary = ",".join(
+        f"{t}({len(c)}@{g})" for t, g, c in per_inbound_clients
+    )
     app.logger.info(
-        f"[XRAY-SYNC] inbounds=[{inbound_summary}] "
+        f"[XRAY-SYNC] layout={xray_layout()} inbounds=[{inbound_summary}] "
         f"total_clients={total_clients_seen} already={already} "
-        f"added={added} add_errors={errors} | "
+        f"skipped_lsi={skipped_lsi} added={added} add_errors={errors} | "
         f"del pending={len(pending)} removed={removed} "
         f"not_in_live={not_in_live} rmu_errors={rmu_errors}"
     )
     return {
         "success": errors == 0 and rmu_errors == 0,
         "method": "sync-config-to-live",
+        "version": __version__,
+        "layout": xray_layout(),
         "total": total_clients_seen,
-        "inbounds": [{"tag": t, "clients": len(c)} for t, c in per_inbound_clients],
+        "inbounds": [
+            {"tag": t, "grpc": g, "clients": len(c)}
+            for t, g, c in per_inbound_clients
+        ],
         "already_in_live": already,
+        "skipped_via_lsi": skipped_lsi,
         "added_to_live": added,
         "errors": errors,
         "pending_rmu": len(pending),
@@ -783,11 +1019,14 @@ def _xray_api_rmu_from_tag(client_uuid: str, tag: str) -> dict:
     """Internal: gRPC rmu from a SPECIFIC inbound tag.
 
     'not found' is treated as success (user already absent — same end state).
+    v4.5.0 — gRPC address is resolved per tag (split layout sends
+    vless-vision-in to :10086).
     """
     email = f"{client_uuid}@vless"
+    _cfg_path, grpc_addr, _svc = _binding_for_tag(tag)
     try:
         result = subprocess.run(
-            ["xray", "api", "rmu", "-s", XRAY_GRPC_ADDR, "-tag", tag, email],
+            ["xray", "api", "rmu", "-s", grpc_addr, "-tag", tag, email],
             capture_output=True, text=True, timeout=5
         )
         out = (result.stdout + result.stderr).lower()
@@ -810,17 +1049,24 @@ def xray_api_remove_user(client_uuid: str) -> dict:
     errored — degraded but the channel №1 user is gone.
 
     Falls back to xray restart only on hard failure of the primary tag.
+    v4.5.0 — discovers VLESS inbounds across all xray configs in current
+    layout (split or single).
     """
-    try:
-        config = read_json_config(XRAY_CONFIG)
-    except Exception as e:
-        app.logger.error(f"[XRAY-GRPC] failed to read config.json: {e}")
-        return restart_service_sync("xray")
-
-    tags = _list_vless_inbound_tags(config)
-    if not tags:
+    locations = _iter_vless_locations()
+    if not locations:
         app.logger.warning("[XRAY-GRPC] no VLESS inbounds — falling back to restart")
         return restart_service_sync("xray")
+
+    seen = set()
+    tags = []
+    for _path, inb, _grpc, _svc in locations:
+        t = inb.get("tag", "vless-in")
+        if t in seen:
+            continue
+        seen.add(t)
+        tags.append(t)
+    tags = [t for t in XRAY_INBOUND_TAGS if t in tags] + \
+           [t for t in tags if t not in XRAY_INBOUND_TAGS]
 
     details = []
     primary_ok = False
@@ -837,11 +1083,13 @@ def xray_api_remove_user(client_uuid: str) -> dict:
         )
         return {"success": True, "method": "grpc-api", "details": details}
 
+    primary_tag = tags[0]
+    _cfg, _grpc, primary_service = _binding_for_tag(primary_tag)
     app.logger.warning(
-        f"[XRAY-GRPC] rmu from primary tag '{tags[0]}' failed for "
-        f"{client_uuid[:8]}: {details[0]}"
+        f"[XRAY-GRPC] rmu from primary tag '{primary_tag}' failed for "
+        f"{client_uuid[:8]}: {details[0]} — restarting {primary_service}"
     )
-    return restart_service_sync("xray")
+    return restart_service_sync(primary_service)
 
 
 # ==================== VLESS (xray) ====================
@@ -879,27 +1127,61 @@ def add_vless_key():
         return jsonify({"error": "Invalid UUID format", "uuid": client_uuid}), 400
 
     try:
-        config = read_json_config(XRAY_CONFIG)
+        # v4.5.0 — read every xray config in current layout, mutate the
+        # in-memory dict per file, and write each file back. Single layout
+        # touches one file; split layout touches two.
+        configs_by_path = {}
+        for path in xray_config_paths():
+            try:
+                configs_by_path[path] = read_json_config(path)
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                return jsonify({"error": f"read {path} failed: {e}"}), 500
 
-        # Collect all VLESS inbounds (v4.4.4 — was: just first one)
-        vless_inbounds = [
-            i for i in config.get("inbounds", []) if i.get("protocol") == "vless"
-        ]
+        if not configs_by_path:
+            return jsonify({"error": "no xray config found"}), 500
 
-        if not vless_inbounds:
+        # Locate every VLESS inbound across all configs (preserve order:
+        # vless-in must be primary so legacy 409-on-primary semantics hold).
+        # entries: [(path, inbound_dict, tag)]
+        entries = []
+        for path, cfg in configs_by_path.items():
+            for inb in cfg.get("inbounds", []):
+                if inb.get("protocol") != "vless":
+                    continue
+                entries.append((path, inb, inb.get("tag", "vless-in")))
+
+        if not entries:
             return jsonify({"error": "VLESS inbound not found in config"}), 500
 
-        # 409 only if user is in the PRIMARY inbound (matches v4.4.3 semantics
-        # for legacy callers; Session-17 partial-drift recovery is allowed).
-        primary = vless_inbounds[0]
-        primary_clients = primary.get("settings", {}).get("clients", [])
-        if any(c.get("id") == client_uuid for c in primary_clients):
+        # Sort so vless-in is primary.
+        def _tag_priority(tag):
+            try:
+                return XRAY_INBOUND_TAGS.index(tag)
+            except ValueError:
+                return len(XRAY_INBOUND_TAGS)
+
+        entries.sort(key=lambda e: _tag_priority(e[2]))
+        primary_path, primary_inbound, primary_tag = entries[0]
+
+        # v4.5.2 — 409 only if UUID is in ALL VLESS inbounds (truly already
+        # there). If it's missing from at least one inbound, fall through
+        # and let the per-inbound idempotent add (below) heal that inbound.
+        # Was: 409 fired as soon as UUID was in PRIMARY (vless-in), which
+        # blocked drift_monitor / sync_keys_to_server from healing
+        # partial drift on vless-vision-in (or any secondary inbound).
+        in_all_inbounds = all(
+            any(c.get("id") == client_uuid for c in inb.get("settings", {}).get("clients", []))
+            for _path, inb, _tag in entries
+        )
+        if in_all_inbounds:
             return jsonify({"error": "UUID already exists", "uuid": client_uuid}), 409
 
         # Add new client to each VLESS inbound (idempotent per inbound).
         added_to = []
-        for inbound in vless_inbounds:
-            tag = inbound.get("tag", "vless-in")
+        touched_paths = set()
+        for path, inbound, tag in entries:
             clients = inbound.get("settings", {}).get("clients", [])
             if any(c.get("id") == client_uuid for c in clients):
                 continue  # already there — skip silently
@@ -907,11 +1189,13 @@ def add_vless_key():
             clients.append({"id": client_uuid, "flow": client_flow})
             inbound.setdefault("settings", {})["clients"] = clients
             added_to.append(tag)
+            touched_paths.add(path)
 
-        write_json_config(XRAY_CONFIG, config)
+        for path in touched_paths:
+            write_json_config(path, configs_by_path[path])
 
         # Add user via gRPC API (zero downtime) or skip if no_restart.
-        # xray_api_add_user is multi-inbound aware (v4.4.4) — handles all tags.
+        # xray_api_add_user is layout- and multi-inbound aware (v4.5.0).
         no_restart = data.get("no_restart", False)
         restart_result = (
             {"success": True, "method": "skipped"}
@@ -922,9 +1206,10 @@ def add_vless_key():
             "success": True,
             "uuid": client_uuid,
             "flow": flow,
+            "layout": xray_layout(),
             "added_to_inbounds": added_to,
             "restart": restart_result,
-            "total_clients": len(primary.get("settings", {}).get("clients", []))
+            "total_clients": len(primary_inbound.get("settings", {}).get("clients", []))
         })
 
     except Exception as e:
@@ -942,19 +1227,42 @@ def delete_vless_key(client_uuid: str):
     vless-vision-in still successfully removes from vless-in).
     """
     try:
-        config = read_json_config(XRAY_CONFIG)
+        # v4.5.0 — same per-config iteration as POST.
+        configs_by_path = {}
+        for path in xray_config_paths():
+            try:
+                configs_by_path[path] = read_json_config(path)
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                return jsonify({"error": f"read {path} failed: {e}"}), 500
 
-        vless_inbounds = [
-            i for i in config.get("inbounds", []) if i.get("protocol") == "vless"
-        ]
-        if not vless_inbounds:
+        if not configs_by_path:
+            return jsonify({"error": "no xray config found"}), 500
+
+        entries = []
+        for path, cfg in configs_by_path.items():
+            for inb in cfg.get("inbounds", []):
+                if inb.get("protocol") != "vless":
+                    continue
+                entries.append((path, inb, inb.get("tag", "vless-in")))
+
+        if not entries:
             return jsonify({"error": "VLESS inbound not found"}), 500
+
+        def _tag_priority(tag):
+            try:
+                return XRAY_INBOUND_TAGS.index(tag)
+            except ValueError:
+                return len(XRAY_INBOUND_TAGS)
+
+        entries.sort(key=lambda e: _tag_priority(e[2]))
 
         # Remove UUID from each inbound, track removals + final primary count.
         removed_from = []
         primary_count = 0
-        for idx, inbound in enumerate(vless_inbounds):
-            tag = inbound.get("tag", "vless-in")
+        touched_paths = set()
+        for idx, (path, inbound, tag) in enumerate(entries):
             clients = inbound.get("settings", {}).get("clients", [])
             before = len(clients)
             clients = [c for c in clients if c.get("id") != client_uuid]
@@ -962,17 +1270,19 @@ def delete_vless_key(client_uuid: str):
             inbound.setdefault("settings", {})["clients"] = clients
             if after < before:
                 removed_from.append(tag)
+                touched_paths.add(path)
             if idx == 0:
                 primary_count = after
 
         if not removed_from:
             return jsonify({"error": "UUID not found"}), 404
 
-        write_json_config(XRAY_CONFIG, config)
+        for path in touched_paths:
+            write_json_config(path, configs_by_path[path])
 
         no_restart = request.args.get("no_restart", "false").lower() == "true"
         if no_restart:
-            # UUID removed from config.json but still in live xray.
+            # UUID removed from config but still in live xray.
             # Queue gRPC rmu for the next /reload (xray_sync_config_to_live).
             # See XRAY_PENDING_RMU_FILE docstring. v4.4.3+.
             _pending_rmu_append(client_uuid)
@@ -983,6 +1293,7 @@ def delete_vless_key(client_uuid: str):
         return jsonify({
             "success": True,
             "deleted_uuid": client_uuid,
+            "layout": xray_layout(),
             "removed_from_inbounds": removed_from,
             "restart": restart_result,
             "total_clients": primary_count
@@ -1006,19 +1317,34 @@ def list_vless_keys():
 
     On legacy single-inbound servers, `inbounds` will have just one entry
     (vless-in) and the response shape is structurally a superset of v4.4.3.
+    v4.5.0 — reads every xray config in current layout.
     """
     try:
-        config = read_json_config(XRAY_CONFIG)
+        entries = []  # (tag, inbound_dict)
+        for path in xray_config_paths():
+            try:
+                cfg = read_json_config(path)
+            except FileNotFoundError:
+                continue
+            for inb in cfg.get("inbounds", []):
+                if inb.get("protocol") != "vless":
+                    continue
+                entries.append((inb.get("tag", ""), inb))
 
-        vless_inbounds = [
-            i for i in config.get("inbounds", []) if i.get("protocol") == "vless"
-        ]
-        if not vless_inbounds:
+        if not entries:
             return jsonify({"error": "VLESS inbound not found"}), 500
 
+        # Sort so vless-in is primary (index 0).
+        def _tag_priority(tag):
+            try:
+                return XRAY_INBOUND_TAGS.index(tag)
+            except ValueError:
+                return len(XRAY_INBOUND_TAGS)
+
+        entries.sort(key=lambda e: _tag_priority(e[0]))
+
         per_inbound = []
-        for inbound in vless_inbounds:
-            tag = inbound.get("tag", "")
+        for tag, inbound in entries:
             clients = inbound.get("settings", {}).get("clients", [])
             per_inbound.append({
                 "tag": tag,
@@ -1032,6 +1358,7 @@ def list_vless_keys():
         primary = per_inbound[0]
         return jsonify({
             "protocol": "vless",
+            "layout": xray_layout(),
             "count": primary["count"],
             "clients": primary["clients"],
             "inbounds": per_inbound,
@@ -1740,18 +2067,33 @@ def index():
 def health_all():
     services = {}
     all_healthy = True
-    for svc in VPN_SERVICES:
+    for svc in vpn_services():
         status = get_service_status(svc)
         services[svc] = status
         if status["status"] != "active":
             all_healthy = False
-    return jsonify({"healthy": all_healthy, "services": services, "timestamp": int(time.time())})
+    return jsonify({
+        "healthy": all_healthy,
+        "services": services,
+        "xray_layout": xray_layout(),
+        "timestamp": int(time.time()),
+    })
 
 
 @app.route("/health/<service>", methods=["GET"])
 @require_token
 def health_service(service: str):
-    if service not in VPN_SERVICES:
+    known = set(vpn_services())
+    # Backward compat: accept "xray" on split layout (returns aggregate).
+    if service == "xray" and xray_layout() == "split":
+        agg = {svc: get_service_status(svc) for svc in xray_services_for_layout()}
+        all_active = all(s["status"] == "active" for s in agg.values())
+        return jsonify({
+            "service": "xray",
+            "status": "active" if all_active else "degraded",
+            "components": agg,
+        })
+    if service not in known:
         return jsonify({"error": f"Unknown service: {service}"}), 404
     return jsonify(get_service_status(service))
 
@@ -1759,7 +2101,13 @@ def health_service(service: str):
 @app.route("/restart/<service>", methods=["POST"])
 @require_token
 def restart(service: str):
-    if service not in VPN_SERVICES:
+    known = set(vpn_services())
+    # Backward compat: legacy callers say "xray" on split layout —
+    # restart_service_sync fans out automatically.
+    if service == "xray" and xray_layout() == "split":
+        result = restart_service_sync("xray")
+        return jsonify({"service": "xray", **result}), 200 if result.get("success") else 500
+    if service not in known:
         return jsonify({"error": f"Unknown service: {service}"}), 404
     result = restart_service_sync(service)
     return jsonify({"service": service, **result}), 200 if result.get("success") else 500
@@ -1769,7 +2117,7 @@ def restart(service: str):
 @require_token
 def restart_all():
     results = []
-    for svc in VPN_SERVICES:
+    for svc in vpn_services():
         status = get_service_status(svc)
         if status["status"] != "active":
             result = restart_service_sync(svc)
@@ -1799,12 +2147,16 @@ def reload_services():
     if not services:
         return jsonify({"error": "No services specified"}), 400
     
-    # Validate all services
-    allowed = set(VPN_SERVICES)
+    # Validate all services. v4.5.0 — accept legacy "xray" alias on
+    # split layout (backend may still send it before the protocol map
+    # ships in the next release).
+    allowed = set(vpn_services())
+    if xray_layout() == "split":
+        allowed.add("xray")
     invalid = [s for s in services if s not in allowed]
     if invalid:
         return jsonify({"error": f"Unknown services: {invalid}"}), 400
-    
+
     results = {}
     for service in services:
         if service in SIGHUP_SUPPORTED:
@@ -1817,7 +2169,7 @@ def reload_services():
             # Debounced restart — Hysteria2 does NOT support SIGHUP (process dies)
             schedule_hysteria_restart(service)
             results[service] = {"success": True, "method": "debounced", "delay_seconds": HYSTERIA_DEBOUNCE_DELAY}
-        elif service == "xray":
+        elif service in ("xray", XRAY_SPLIT_VLESS_SERVICE, XRAY_SPLIT_VISION_SERVICE):
             # Sync config.json → live xray via gRPC AddUser.
             # Previously this was a no-op under the assumption that users
             # were added inline via gRPC during the /keys/vless POST. That
